@@ -29,7 +29,7 @@ RUN rm -rf $CATALINA_HOME/webapps/*
 RUN chmod +x $CATALINA_HOME/bin/*.sh
 
 # Copy WAR file
-COPY target/order-book-demo.war $CATALINA_HOME/webapps/ROOT.war
+COPY target/orderbook.war $CATALINA_HOME/webapps/ROOT.war
 
 EXPOSE 8085
 
