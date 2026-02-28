@@ -1,0 +1,113 @@
+- hosts: "{{ env }}"
+  become: yes
+  tasks:
+    - name: Check if deployment exists
+      shell: kubectl get deployment | grep -v NAME | awk '{print $1}' | grep orderbook | wc -l
+      register: deployment_exists
+      changed_when: false
+
+    - name: Delete existing deployment
+      shell: kubectl delete deployment orderbook
+      when: deployment_exists.stdout|int > 0
+
+    - name: Create deployment with Prometheus annotations
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: orderbook
+          labels:
+            app: orderbook
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: orderbook
+          template:
+            metadata:
+              labels:
+                app: orderbook
+              annotations:
+                prometheus.io/scrape: "true"
+                prometheus.io/port: "8085"
+                prometheus.io/path: "/actuator/prometheus"
+            spec:
+              containers:
+              - name: orderbook
+                image: kpashindla/orderbook:{{ build }}
+                ports:
+                - containerPort: 8085
+                  name: http
+                env:
+                - name: MANAGEMENT_METRICS_TAGS_APPLICATION
+                  value: "orderbook"
+                - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
+                  value: "prometheus,health,info"
+                livenessProbe:
+                  httpGet:
+                    path: /actuator/health
+                    port: 8085
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /actuator/health
+                    port: 8085
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+        EOF
+      register: deployment_result
+
+    - name: Check if service exists
+      shell: kubectl get svc | grep orderbook | awk '{print $1}' | wc -l
+      register: service_exists
+      changed_when: false
+
+    - name: Delete existing service
+      shell: kubectl delete svc orderbook
+      when: service_exists.stdout|int > 0
+      ignore_errors: yes
+
+    - name: Create service with annotations
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: orderbook
+          labels:
+            app: orderbook
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8085"
+            prometheus.io/path: "/actuator/prometheus"
+        spec:
+          selector:
+            app: orderbook
+          type: NodePort
+          ports:
+          - name: http
+            port: 80
+            targetPort: 8085
+          - name: metrics
+            port: 8085
+            targetPort: 8085
+        EOF
+      register: service_result
+
+    - name: Scale replicas
+      shell: kubectl scale deploy orderbook --replicas=10
+      when: deployment_result.changed or deployment_result.failed == false
+
+    - name: Wait for all pods to be ready
+      shell: kubectl wait --for=condition=ready pod -l app=orderbook --timeout=60s
+      register: wait_result
+      ignore_errors: yes
+
+    - name: Check deployment status
+      shell: kubectl get pods -l app=orderbook
+      register: pod_status
+
+    - debug:
+        var: pod_status.stdout_lines

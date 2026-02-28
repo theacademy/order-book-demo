@@ -115,7 +115,7 @@
             </plugin>
         </plugins>
 
-        <finalName>order-book</finalName>
+        <finalName>orderbook</finalName>
 
     </build>
 
