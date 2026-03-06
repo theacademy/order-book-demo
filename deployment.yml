@@ -17,7 +17,7 @@ spec:
         app: orderbook
         build: "BUILD_PLACEHOLDER"
     spec:
-      imagePullSecrets:  # 👈 ADD THIS SECTION RIGHT HERE
+      imagePullSecrets:
         - name: ecr-pull-secret
       containers:
         - name: tomcat
@@ -29,11 +29,11 @@ spec:
               value: "BUILD_PLACEHOLDER"
           resources:
             requests:
-              memory: "512Mi"
-              cpu: "250m"
+              memory: "256Mi"  # Reduced
+              cpu: "100m"      # Reduced
             limits:
-              memory: "1Gi"
-              cpu: "500m"
+              memory: "512Mi"  # Reduced
+              cpu: "300m"      # Reduced
           readinessProbe:
             httpGet:
               path: /
