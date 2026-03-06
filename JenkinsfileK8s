@@ -112,15 +112,97 @@ pipeline {
                             --docker-password=\$(aws ecr get-login-password) \
                             --namespace qa
 
-                        # Deploy application with imagePullSecret
-                        sed -e "s|IMAGE_PLACEHOLDER|${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}|g" \
-                            -e "s|BUILD_PLACEHOLDER|${BUILD_NUMBER}|g" \
-                            deployment.yml | kubectl apply -f -
+                        # Deploy application with the same config as working Ansible deployment
+                        cat << 'EOF' | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: orderbook
+          namespace: qa
+          labels:
+            app: orderbook
+            build: ${BUILD_NUMBER}
+        spec:
+          replicas: 2
+          selector:
+            matchLabels:
+              app: orderbook
+          template:
+            metadata:
+              labels:
+                app: orderbook
+                build: ${BUILD_NUMBER}
+              annotations:
+                prometheus.io/scrape: "true"
+                prometheus.io/port: "8085"
+                prometheus.io/path: "/actuator/prometheus"
+            spec:
+              imagePullSecrets:
+              - name: ecr-pull-secret
+              containers:
+              - name: orderbook
+                image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+                ports:
+                - containerPort: 8085
+                  name: http
+                env:
+                - name: MANAGEMENT_METRICS_TAGS_APPLICATION
+                  value: "orderbook"
+                - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
+                  value: "prometheus,health,info"
+                - name: BUILD_NUMBER
+                  value: "${BUILD_NUMBER}"
+                - name: SPRING_PROFILES_ACTIVE
+                  value: "production"
+                resources:
+                  requests:
+                    memory: "256Mi"
+                    cpu: "100m"
+                  limits:
+                    memory: "512Mi"
+                    cpu: "300m"
+                livenessProbe:
+                  httpGet:
+                    path: /actuator/health
+                    port: 8085
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /actuator/health
+                    port: 8085
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: orderbook
+          namespace: qa
+          labels:
+            app: orderbook
+          annotations:
+            prometheus.io/scrape: "true"
+            prometheus.io/port: "8085"
+            prometheus.io/path: "/actuator/prometheus"
+        spec:
+          selector:
+            app: orderbook
+          type: LoadBalancer
+          ports:
+          - name: http
+            port: 80
+            targetPort: 8085
+          - name: metrics
+            port: 8085
+            targetPort: 8085
+        EOF
 
-                        kubectl apply -f service.yml
+                        # Wait for rollout
+                        kubectl rollout status deployment/orderbook -n qa --timeout=3m
 
-                        # Wait for rollout with more time
-                        kubectl rollout status deployment/orderbook -n qa --timeout=5m
+                        # Get the service URL
+                        kubectl get svc -n qa orderbook
                     """
                 }
             }
