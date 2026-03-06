@@ -104,65 +104,18 @@ pipeline {
                         # Create namespace
                         kubectl create namespace qa --dry-run=client -o yaml | kubectl apply -f -
 
-                        # Deploy application
-                        cat << 'EOF' | kubectl apply -f -
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: orderbook
-  namespace: qa
-  labels:
-    app: orderbook
-    build: ${BUILD_NUMBER}
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: orderbook
-  template:
-    metadata:
-      labels:
-        app: orderbook
-        build: ${BUILD_NUMBER}
-    spec:
-      containers:
-      - name: tomcat
-        image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-        ports:
-        - containerPort: ${APP_PORT}
-        env:
-        - name: BUILD_NUMBER
-          value: "${BUILD_NUMBER}"
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
-        readinessProbe:
-          httpGet:
-            path: /
-            port: ${APP_PORT}
-          initialDelaySeconds: 30
-          periodSeconds: 10
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: orderbook-service
-  namespace: qa
-spec:
-  selector:
-    app: orderbook
-  ports:
-  - port: 80
-    targetPort: ${APP_PORT}
-  type: LoadBalancer
-EOF
+                        # Replace placeholders and deploy
+                        sed -e "s|IMAGE_PLACEHOLDER|${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}|g" \
+                            -e "s|BUILD_PLACEHOLDER|${BUILD_NUMBER}|g" \
+                            deployment.yaml | kubectl apply -f -
+
+                        kubectl apply -f service.yaml
 
                         # Wait for rollout
                         kubectl rollout status deployment/orderbook -n qa --timeout=3m
+
+                        # Get service info
+                        kubectl get svc -n qa orderbook-service
                     """
                 }
             }
