@@ -1,0 +1,249 @@
+pipeline {
+    agent any
+
+    environment {
+        ANSIBLE_HOST_KEY_CHECKING = "False"
+
+        // AWS EKS Configuration
+        AWS_REGION = 'eu-central-1'
+        EKS_CLUSTER_NAME = 'test-cluster-1'
+        AWS_ACCOUNT_ID = '271758791556'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPOSITORY = 'orderbook-tomcat'
+        IMAGE_TAG = "${BUILD_NUMBER}"
+
+        // App Configuration
+        APP_PORT = '8085'  // Matches your Tomcat config
+    }
+
+    tools {
+        maven 'MAVEN_HOME'
+        jdk 'JAVA_HOME'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git url: 'https://github.com/theacademy/order-book-demo'
+            }
+        }
+
+        stage('Compile') {
+            steps {
+                echo 'compiling..'
+                sh 'mvn compile'
+            }
+        }
+
+        stage('Code Review (PMD)') {
+            steps {
+                echo 'codereview..'
+                sh 'mvn pmd:pmd'
+            }
+            post {
+                success {
+                    recordIssues enabledForFailure: true, tool: pmdParser(pattern: '**/target/pmd.xml')
+                }
+            }
+        }
+
+        stage('Test with Clover') {
+            steps {
+                echo 'running tests with clover..'
+                sh 'mvn test -Pcoverage'
+                sh 'mvn clover:clover clover:aggregate -Pcoverage'
+            }
+        }
+
+        stage('Publish Clover Report') {
+            steps {
+                clover(
+                    cloverReportDir: 'target/site/clover',
+                    cloverReportFileName: 'clover.xml',
+                    healthyTarget: [methodCoverage: 70, conditionalCoverage: 80, statementCoverage: 80],
+                    unhealthyTarget: [methodCoverage: 50, conditionalCoverage: 50, statementCoverage: 50],
+                    failingTarget: [methodCoverage: 0, conditionalCoverage: 0, statementCoverage: 0]
+                )
+            }
+        }
+
+        stage('Package') {
+            steps {
+                echo 'packaging..'
+                sh 'mvn package'
+            }
+        }
+
+        stage('Create ECR Repository') {
+            steps {
+                sh """
+                    # Create ECR repository if it doesn't exist
+                    aws ecr describe-repositories --repository-names ${ECR_REPOSITORY} --region ${AWS_REGION} || \
+                    aws ecr create-repository --repository-name ${ECR_REPOSITORY} --region ${AWS_REGION}
+                """
+            }
+        }
+
+        stage('Build and Push Docker Image') {
+            steps {
+                script {
+                    sh """
+                        # Login to ECR
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                        # Build image (your existing Dockerfile uses port 8085)
+                        docker build --file Dockerfile \
+                            --tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
+                            --tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
+
+                        # Push to ECR
+                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to EKS') {
+            steps {
+                script {
+                    sh """
+                        # Configure kubectl for EKS
+                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+
+                        # Create namespace
+                        kubectl create namespace qa --dry-run=client -o yaml | kubectl apply -f -
+
+                        # Deploy application with your Tomcat config
+                        cat << 'EOF' | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orderbook
+  namespace: qa
+  labels:
+    app: orderbook
+    build: ${BUILD_NUMBER}
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orderbook
+  template:
+    metadata:
+      labels:
+        app: orderbook
+        build: ${BUILD_NUMBER}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"  # If your app has actuator
+        prometheus.io/port: "${APP_PORT}"
+    spec:
+      containers:
+      - name: tomcat
+        image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+        ports:
+        - containerPort: ${APP_PORT}
+        env:
+        - name: BUILD_NUMBER
+          value: "${BUILD_NUMBER}"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        readinessProbe:
+          httpGet:
+            path: /
+            port: ${APP_PORT}
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /
+            port: ${APP_PORT}
+          initialDelaySeconds: 60
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orderbook-service
+  namespace: qa
+  labels:
+    app: orderbook
+spec:
+  selector:
+    app: orderbook
+  ports:
+  - port: 80          # External port
+    targetPort: ${APP_PORT}  # Maps to Tomcat's 8085
+    name: http
+  type: LoadBalancer
+EOF
+
+                        # Wait for deployment
+                        kubectl rollout status deployment/orderbook -n qa --timeout=3m
+                    """
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh """
+                    echo "📊 Deployment Status:"
+                    kubectl get pods -n qa -l app=orderbook
+
+                    echo -e "\n📦 Service Details:"
+                    kubectl get svc -n qa orderbook-service
+
+                    # Get the LoadBalancer URL
+                    echo "⏳ Waiting for LoadBalancer URL (this may take 1-2 minutes)..."
+                    sleep 30
+
+                    LB_URL=\$(kubectl get svc -n qa orderbook-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+                    if [ -n "\$LB_URL" ]; then
+                        echo -e "\n✅ YOUR APPLICATION IS LIVE AT: http://\$LB_URL"
+                        echo "   (Your app is running on Tomcat port 8085 inside the container)"
+                        echo "   Jenkins is still available at: http://\$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):8080"
+                    else
+                        echo "⏳ LoadBalancer still provisioning. Check later with:"
+                        echo "   kubectl get svc -n qa orderbook-service"
+                    fi
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Tomcat application deployed successfully to EKS!'
+            script {
+                // Get the application URL
+                LB_URL = sh(
+                    script: "kubectl get svc -n qa orderbook-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Provisioning'",
+                    returnStdout: true
+                ).trim()
+                if (LB_URL != 'Provisioning' && LB_URL != '') {
+                    echo "🌐 Application URL: http://${LB_URL}"
+                    echo "   Test with: curl http://${LB_URL}"
+                }
+            }
+        }
+        failure {
+            echo '❌ Deployment failed! Check logs:'
+            sh '''
+                echo "--- Recent Pod Events ---"
+                kubectl describe pods -n qa -l app=orderbook | grep -A10 Events
+            '''
+        }
+        always {
+            // Optional: Clean workspace
+            cleanWs()
+        }
+    }
+}
