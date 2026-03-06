@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orderbook
+  namespace: qa
+  labels:
+    app: orderbook
+    build: "BUILD_PLACEHOLDER"  # Will be replaced
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: orderbook
+  template:
+    metadata:
+      labels:
+        app: orderbook
+        build: "BUILD_PLACEHOLDER"
+    spec:
+      containers:
+        - name: tomcat
+          image: IMAGE_PLACEHOLDER
+          ports:
+            - containerPort: 8085
+          env:
+            - name: BUILD_NUMBER
+              value: "BUILD_PLACEHOLDER"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8085
+            initialDelaySeconds: 30
+            periodSeconds: 10
