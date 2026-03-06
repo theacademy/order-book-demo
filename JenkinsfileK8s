@@ -2,15 +2,16 @@ pipeline {
     agent any
 
     environment {
-        ANSIBLE_HOST_KEY_CHECKING = "False"
-
-        // AWS EKS Configuration
+        // AWS Configuration
         AWS_REGION = 'eu-central-1'
         EKS_CLUSTER_NAME = 'test-cluster-1'
         AWS_ACCOUNT_ID = '271758791556'
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         ECR_REPOSITORY = 'orderbook-tomcat'
         IMAGE_TAG = "${BUILD_NUMBER}"
+        APP_NAME = 'orderbook'
+        NAMESPACE = 'qa'
+        APP_PORT = '8085'
     }
 
     tools {
@@ -25,34 +26,35 @@ pipeline {
             }
         }
 
-        stage('Compile') {
-            steps {
-                echo 'compiling..'
-                sh 'mvn compile'
-            }
-        }
+        stage('Build & Test') {
+            parallel {
+                stage('Compile') {
+                    steps {
+                        sh 'mvn compile'
+                    }
+                }
 
-        stage('Code Review (PMD)') {
-            steps {
-                echo 'codereview..'
-                sh 'mvn pmd:pmd'
-            }
-            post {
-                success {
-                    recordIssues enabledForFailure: true, tool: pmdParser(pattern: '**/target/pmd.xml')
+                stage('Code Review') {
+                    steps {
+                        sh 'mvn pmd:pmd'
+                    }
+                    post {
+                        success {
+                            recordIssues enabledForFailure: true, tool: pmdParser(pattern: '**/target/pmd.xml')
+                        }
+                    }
+                }
+
+                stage('Test') {
+                    steps {
+                        sh 'mvn test -Pcoverage'
+                        sh 'mvn clover:clover clover:aggregate -Pcoverage'
+                    }
                 }
             }
         }
 
-        stage('Test with Clover') {
-            steps {
-                echo 'running tests with clover..'
-                sh 'mvn test -Pcoverage'
-                sh 'mvn clover:clover clover:aggregate -Pcoverage'
-            }
-        }
-
-        stage('Publish Clover Report') {
+        stage('Publish Test Report') {
             steps {
                 clover(
                     cloverReportDir: 'target/site/clover',
@@ -66,34 +68,24 @@ pipeline {
 
         stage('Package') {
             steps {
-                echo 'packaging..'
                 sh 'mvn package'
             }
         }
 
-        stage('Create ECR Repository') {
-            steps {
-                withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
-                    sh """
-                        aws ecr describe-repositories --repository-names ${ECR_REPOSITORY} || \
-                        aws ecr create-repository --repository-name ${ECR_REPOSITORY}
-                    """
-                }
+        stage('Docker Build & Push') {
+            environment {
+                ECR_CREDS = credentials('aws-credentials')
             }
-        }
-
-        stage('Build and Push Docker Image') {
             steps {
-                withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
+                script {
                     sh """
                         # Login to ECR
-                        aws ecr get-login-password | \
-                        docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                            docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
-                        # Build and tag image
-                        docker build --file Dockerfile \
-                            --tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
-                            --tag ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
+                        # Build image
+                        docker build -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
+                                    -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
 
                         # Push to ECR
                         docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
@@ -104,67 +96,76 @@ pipeline {
         }
 
         stage('Deploy to EKS') {
+            environment {
+                ECR_CREDS = credentials('aws-credentials')
+            }
             steps {
-                withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
-                    sh """
+                script {
+                    sh '''
+                        #!/bin/bash
+                        set -e
+
+                        echo "🚀 Deploying to EKS cluster: ${EKS_CLUSTER_NAME}"
+
                         # Configure kubectl
                         aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
 
-                        # Create namespace
-                        kubectl create namespace qa --dry-run=client -o yaml | kubectl apply -f -
+                        # Create namespace if not exists
+                        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
-                        # Create ECR pull secret
-                        kubectl delete secret ecr-pull-secret -n qa --ignore-not-found
+                        # Create/update ECR pull secret
+                        kubectl delete secret ecr-pull-secret -n ${NAMESPACE} --ignore-not-found
                         kubectl create secret docker-registry ecr-pull-secret \
                             --docker-server=${ECR_REGISTRY} \
                             --docker-username=AWS \
-                            --docker-password=\$(aws ecr get-login-password) \
-                            --namespace qa
+                            --docker-password=$(aws ecr get-login-password) \
+                            --namespace ${NAMESPACE}
 
-                        # Deploy application with same configuration as working Ansible deployment
-                        kubectl apply -f - << 'EOF'
+                        # Deploy application
+                        echo "📦 Deploying application..."
+                        cat << EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: orderbook
-  namespace: qa
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
   labels:
-    app: orderbook
-    build: ${BUILD_NUMBER}
+    app: ${APP_NAME}
+    version: ${IMAGE_TAG}
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: orderbook
+      app: ${APP_NAME}
   template:
     metadata:
       labels:
-        app: orderbook
-        build: ${BUILD_NUMBER}
+        app: ${APP_NAME}
+        version: ${IMAGE_TAG}
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8085"
+        prometheus.io/port: "${APP_PORT}"
         prometheus.io/path: "/actuator/prometheus"
     spec:
       imagePullSecrets:
       - name: ecr-pull-secret
       containers:
-      - name: orderbook
+      - name: ${APP_NAME}
         image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
         ports:
-        - containerPort: 8085
+        - containerPort: ${APP_PORT}
           name: http
         env:
         - name: MANAGEMENT_METRICS_TAGS_APPLICATION
-          value: "orderbook"
+          value: "${APP_NAME}"
         - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
-          value: "prometheus,health,info"
-        - name: BUILD_NUMBER
-          value: "${BUILD_NUMBER}"
+          value: "prometheus,health,info,metrics"
         - name: SPRING_PROFILES_ACTIVE
           value: "production"
         - name: SERVER_PORT
-          value: "8085"
+          value: "${APP_PORT}"
+        - name: BUILD_NUMBER
+          value: "${IMAGE_TAG}"
         resources:
           requests:
             memory: "256Mi"
@@ -174,75 +175,160 @@ spec:
             cpu: "300m"
         livenessProbe:
           httpGet:
-            path: /actuator/health
-            port: 8085
-          initialDelaySeconds: 30
+            path: /actuator/health/liveness
+            port: ${APP_PORT}
+          initialDelaySeconds: 45
           periodSeconds: 10
+          failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /actuator/health
-            port: 8085
+            path: /actuator/health/readiness
+            port: ${APP_PORT}
           initialDelaySeconds: 30
           periodSeconds: 10
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /actuator/health
+            port: ${APP_PORT}
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 12
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: orderbook
-  namespace: qa
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
   labels:
-    app: orderbook
+    app: ${APP_NAME}
   annotations:
     prometheus.io/scrape: "true"
-    prometheus.io/port: "8085"
+    prometheus.io/port: "${APP_PORT}"
     prometheus.io/path: "/actuator/prometheus"
 spec:
   selector:
-    app: orderbook
+    app: ${APP_NAME}
   type: LoadBalancer
   ports:
   - name: http
     port: 80
-    targetPort: 8085
+    targetPort: ${APP_PORT}
   - name: metrics
-    port: 8085
-    targetPort: 8085
+    port: ${APP_PORT}
+    targetPort: ${APP_PORT}
 EOF
 
-                        # Wait for rollout
-                        kubectl rollout status deployment/orderbook -n qa --timeout=3m
-                    """
+                        echo "⏳ Waiting for rollout to complete..."
+                        kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=3m
+                    '''
                 }
             }
         }
 
         stage('Verify Deployment') {
+            environment {
+                ECR_CREDS = credentials('aws-credentials')
+            }
             steps {
-                withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
+                script {
                     sh '''
-                        echo "📊 Verifying Deployment..."
-                        kubectl rollout status deployment/orderbook -n qa --timeout=2m
-                        kubectl get pods -n qa -l app=orderbook
-                        kubectl get svc -n qa orderbook
+                        #!/bin/bash
+                        set -e
+
+                        echo "🔍 Verifying deployment..."
+
+                        # Check pod status
+                        echo "📊 Pod Status:"
+                        kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}
+
+                        # Check service
+                        echo -e "\n🌐 Service Details:"
+                        kubectl get svc -n ${NAMESPACE} ${APP_NAME}
+
+                        # Get application URL
+                        LB_URL=$(kubectl get svc -n ${NAMESPACE} ${APP_NAME} \
+                            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+
+                        if [ -n "$LB_URL" ]; then
+                            echo -e "\n✅ Application is live at: http://$LB_URL"
+                            echo "   Health endpoint: http://$LB_URL/actuator/health"
+                            echo "   Metrics endpoint: http://$LB_URL/actuator/prometheus"
+
+                            # Test health endpoint
+                            echo -e "\n🏥 Testing health endpoint..."
+                            curl -s -o /dev/null -w "Health check returned: %{http_code}\n" http://$LB_URL/actuator/health || true
+                        else
+                            echo "⏳ LoadBalancer still provisioning..."
+                        fi
                     '''
                 }
             }
         }
+    }
 
-        post {
-            failure {
+    post {
+        success {
+            script {
+                echo '✅ Pipeline completed successfully!'
                 withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
-                    echo '❌ Deployment failed! Running diagnostics...'
-                    sh '''
-                        echo "--- Recent Pod Events ---"
-                        kubectl describe pods -n qa -l app=orderbook | grep -A20 Events
+                    LB_URL = sh(
+                        script: "kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Provisioning'",
+                        returnStdout: true
+                    ).trim()
 
-                        echo -e "\n--- Pod Logs ---"
-                        kubectl logs -n qa -l app=orderbook --tail=50
-
-                        echo -e "\n--- Deployment Status ---"
-                        kubectl describe deployment orderbook -n qa
-                    '''
+                    // Send notification (customize as needed)
+                    echo """
+                        🎉 Deployment Successful!
+                        Application: ${APP_NAME}
+                        Version: ${IMAGE_TAG}
+                        URL: http://${LB_URL}
+                        Health: http://${LB_URL}/actuator/health
+                        Metrics: http://${LB_URL}/actuator/prometheus
+                        Namespace: ${NAMESPACE}
+                        Cluster: ${EKS_CLUSTER_NAME}
+                    """
                 }
             }
         }
+
+        failure {
+            echo '❌ Pipeline failed! Running diagnostics...'
+            withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
+                sh '''
+                    #!/bin/bash
+                    echo "🔍 Gathering failure diagnostics..."
+
+                    # Check if namespace exists
+                    if kubectl get namespace ${NAMESPACE} &>/dev/null; then
+                        echo -e "\n📊 Pod Status:"
+                        kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}
+
+                        echo -e "\n📝 Pod Events:"
+                        kubectl describe pods -n ${NAMESPACE} -l app=${APP_NAME} | grep -A20 Events
+
+                        echo -e "\n📋 Recent Logs:"
+                        for pod in $(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o name | head -1); do
+                            echo "--- $pod ---"
+                            kubectl logs $pod -n ${NAMESPACE} --tail=30
+                        done
+
+                        echo -e "\n⚙️ Deployment Status:"
+                        kubectl describe deployment ${APP_NAME} -n ${NAMESPACE}
+                    else
+                        echo "Namespace ${NAMESPACE} does not exist yet."
+                    fi
+
+                    echo -e "\n📦 ECR Images:"
+                    aws ecr describe-images --repository-name ${ECR_REPOSITORY} --region ${AWS_REGION} \
+                        --query 'imageDetails[*].imageTags' --output table
+                '''
+            }
+        }
+
+        always {
+            echo '🧹 Cleaning up workspace...'
+            cleanWs()
+        }
+    }
+}
