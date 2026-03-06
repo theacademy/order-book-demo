@@ -219,54 +219,30 @@ EOF
         stage('Verify Deployment') {
             steps {
                 withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
-                    sh """
-                        echo "📊 Deployment Status:"
+                    sh '''
+                        echo "📊 Verifying Deployment..."
+                        kubectl rollout status deployment/orderbook -n qa --timeout=2m
                         kubectl get pods -n qa -l app=orderbook
-
-                        echo -e "\n🌐 Service Details:"
                         kubectl get svc -n qa orderbook
-
-                        echo -e "\n⏳ Getting LoadBalancer URL..."
-                        sleep 10
-                        LB_URL=\$(kubectl get svc -n qa orderbook -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-                        if [ -n "\$LB_URL" ]; then
-                            echo "✅ Application URL: http://\$LB_URL"
-                            echo "   Actuator Health: http://\$LB_URL/actuator/health"
-                            echo "   Prometheus Metrics: http://\$LB_URL/actuator/prometheus"
-                        else
-                            echo "⏳ LoadBalancer still provisioning..."
-                        fi
-                    """
+                    '''
                 }
             }
         }
-    }
 
-    post {
-        success {
-            echo '✅ Deployment to EKS successful!'
-            script {
-                // Send notification with app URL
-                LB_URL = sh(
-                    script: "kubectl get svc -n qa orderbook -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Provisioning'",
-                    returnStdout: true
-                ).trim()
-                echo "Application will be available at: http://${LB_URL}"
-                echo "Health check: http://${LB_URL}/actuator/health"
+        post {
+            failure {
+                withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
+                    echo '❌ Deployment failed! Running diagnostics...'
+                    sh '''
+                        echo "--- Recent Pod Events ---"
+                        kubectl describe pods -n qa -l app=orderbook | grep -A20 Events
+
+                        echo -e "\n--- Pod Logs ---"
+                        kubectl logs -n qa -l app=orderbook --tail=50
+
+                        echo -e "\n--- Deployment Status ---"
+                        kubectl describe deployment orderbook -n qa
+                    '''
+                }
             }
         }
-        failure {
-            echo '❌ Deployment failed! Check logs:'
-            sh '''
-                echo "--- Recent Pod Events ---"
-                kubectl describe pods -n qa -l app=orderbook | grep -A20 Events
-
-                echo -e "\n--- Pod Logs ---"
-                kubectl logs -n qa -l app=orderbook --tail=50
-            '''
-        }
-        always {
-            cleanWs()
-        }
-    }
-}
