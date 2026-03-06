@@ -5,7 +5,7 @@ metadata:
   namespace: qa
   labels:
     app: orderbook
-    build: "BUILD_PLACEHOLDER"  # Will be replaced
+    build: "BUILD_PLACEHOLDER"
 spec:
   replicas: 2
   selector:
@@ -17,6 +17,8 @@ spec:
         app: orderbook
         build: "BUILD_PLACEHOLDER"
     spec:
+      imagePullSecrets:  # 👈 ADD THIS SECTION RIGHT HERE
+        - name: ecr-pull-secret
       containers:
         - name: tomcat
           image: IMAGE_PLACEHOLDER
