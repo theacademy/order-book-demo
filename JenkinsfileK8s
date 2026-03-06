@@ -107,9 +107,9 @@ pipeline {
                         # Replace placeholders and deploy
                         sed -e "s|IMAGE_PLACEHOLDER|${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}|g" \
                             -e "s|BUILD_PLACEHOLDER|${BUILD_NUMBER}|g" \
-                            deployment.yaml | kubectl apply -f -
+                            deployment.yml | kubectl apply -f -
 
-                        kubectl apply -f service.yaml
+                        kubectl apply -f service.yml
 
                         # Wait for rollout
                         kubectl rollout status deployment/orderbook -n qa --timeout=3m
