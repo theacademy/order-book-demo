@@ -22,7 +22,7 @@ pipeline {
     stages {
         stage('Checkout') {
             steps {
-                git url: 'https://github.com/theacademy/order-book-demo'
+                git url: 'https://github.com/theacademy/order-book-demo.git'
             }
         }
 
@@ -73,196 +73,209 @@ pipeline {
         }
 
         stage('Docker Build & Push') {
-            environment {
-                ECR_CREDS = credentials('aws-credentials')
-            }
             steps {
-                script {
-                    sh """
-                        # Login to ECR
-                        aws ecr get-login-password --region ${AWS_REGION} | \
-                            docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
+                    script {
+                        sh """
+                            # Login to ECR
+                            aws ecr get-login-password | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
-                        # Build image
-                        docker build -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
-                                    -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
+                            # Build Docker image
+                            docker build -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
+                                        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
 
-                        # Push to ECR
-                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-                        docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
-                    """
+                            # Push images to ECR
+                            docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+                            docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+                        """
+                    }
                 }
             }
         }
 
         stage('Deploy to EKS') {
-            environment {
-                ECR_CREDS = credentials('aws-credentials')
-            }
             steps {
-                script {
-                    sh '''
-                        #!/bin/bash
-                        set -e
+                withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
+                    script {
+                        sh """#!/bin/bash
+                            set -e
 
-                        echo "🚀 Deploying to EKS cluster: ${EKS_CLUSTER_NAME}"
+                            echo "🚀 Deploying to EKS cluster: ${EKS_CLUSTER_NAME}"
 
-                        # Configure kubectl
-                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+                            # Configure kubectl
+                            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
 
-                        # Create namespace if not exists
-                        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                            # Create namespace if not exists
+                            kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
-                        # Create/update ECR pull secret
-                        kubectl delete secret ecr-pull-secret -n ${NAMESPACE} --ignore-not-found
-                        kubectl create secret docker-registry ecr-pull-secret \
-                            --docker-server=${ECR_REGISTRY} \
-                            --docker-username=AWS \
-                            --docker-password=$(aws ecr get-login-password) \
-                            --namespace ${NAMESPACE}
+                            # Create ECR pull secret (separately to avoid YAML parsing issues)
+                            echo "🔑 Creating ECR pull secret..."
+                            kubectl delete secret ecr-pull-secret -n ${NAMESPACE} --ignore-not-found
+                            ECR_PASSWORD=\$(aws ecr get-login-password)
+                            kubectl create secret docker-registry ecr-pull-secret \
+                                --docker-server=${ECR_REGISTRY} \
+                                --docker-username=AWS \
+                                --docker-password="\${ECR_PASSWORD}" \
+                                --namespace ${NAMESPACE}
 
-                        # Deploy application - NOTE THE QUOTES AROUND ${BUILD_NUMBER}
-                        echo "📦 Deploying application..."
-                        cat << 'EOF' | kubectl apply -f -
-        apiVersion: apps/v1
-        kind: Deployment
-        metadata:
-          name: ${APP_NAME}
-          namespace: ${NAMESPACE}
-          labels:
-            app: ${APP_NAME}
-            build: "${BUILD_NUMBER}"  # QUOTES ARE CRITICAL
-        spec:
-          replicas: 2
-          selector:
-            matchLabels:
-              app: ${APP_NAME}
-          template:
-            metadata:
-              labels:
-                app: ${APP_NAME}
-                build: "${BUILD_NUMBER}"  # QUOTES ARE CRITICAL
-              annotations:
-                prometheus.io/scrape: "true"
-                prometheus.io/port: "${APP_PORT}"
-                prometheus.io/path: "/actuator/prometheus"
-            spec:
-              imagePullSecrets:
-              - name: ecr-pull-secret
-              containers:
-              - name: ${APP_NAME}
-                image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-                ports:
-                - containerPort: ${APP_PORT}
-                  name: http
-                env:
-                - name: MANAGEMENT_METRICS_TAGS_APPLICATION
-                  value: "${APP_NAME}"
-                - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
-                  value: "prometheus,health,info,metrics"
-                - name: SPRING_PROFILES_ACTIVE
-                  value: "production"
-                - name: SERVER_PORT
-                  value: "${APP_PORT}"
-                - name: BUILD_NUMBER
-                  value: "${BUILD_NUMBER}"
-                resources:
-                  requests:
-                    memory: "256Mi"
-                    cpu: "100m"
-                  limits:
-                    memory: "512Mi"
-                    cpu: "300m"
-                livenessProbe:
-                  httpGet:
-                    path: /actuator/health/liveness
-                    port: ${APP_PORT}
-                  initialDelaySeconds: 45
-                  periodSeconds: 10
-                  failureThreshold: 3
-                readinessProbe:
-                  httpGet:
-                    path: /actuator/health/readiness
-                    port: ${APP_PORT}
-                  initialDelaySeconds: 30
-                  periodSeconds: 10
-                  failureThreshold: 3
-                startupProbe:
-                  httpGet:
-                    path: /actuator/health
-                    port: ${APP_PORT}
-                  initialDelaySeconds: 15
-                  periodSeconds: 5
-                  failureThreshold: 12
-        ---
-        apiVersion: v1
-        kind: Service
-        metadata:
-          name: ${APP_NAME}
-          namespace: ${NAMESPACE}
-          labels:
-            app: ${APP_NAME}
-            build: "${BUILD_NUMBER}"  # QUOTES HERE TOO
-          annotations:
-            prometheus.io/scrape: "true"
-            prometheus.io/port: "${APP_PORT}"
-            prometheus.io/path: "/actuator/prometheus"
-        spec:
-          selector:
-            app: ${APP_NAME}
-          type: LoadBalancer
-          ports:
-          - name: http
-            port: 80
-            targetPort: ${APP_PORT}
-          - name: metrics
+                            # Create temporary deployment file
+                            echo "📦 Creating deployment configuration..."
+                            cat > /tmp/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_NAME}
+    build: "${IMAGE_TAG}"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+        build: "${IMAGE_TAG}"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "${APP_PORT}"
+        prometheus.io/path: "/actuator/prometheus"
+    spec:
+      imagePullSecrets:
+      - name: ecr-pull-secret
+      containers:
+      - name: ${APP_NAME}
+        image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+        ports:
+        - containerPort: ${APP_PORT}
+        env:
+        - name: MANAGEMENT_METRICS_TAGS_APPLICATION
+          value: "${APP_NAME}"
+        - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
+          value: "prometheus,health,info,metrics"
+        - name: BUILD_NUMBER
+          value: "${IMAGE_TAG}"
+        - name: SPRING_PROFILES_ACTIVE
+          value: "production"
+        - name: SERVER_PORT
+          value: "${APP_PORT}"
+        - name: JAVA_OPTS
+          value: "-Xmx256m -Xms128m"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "300m"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
             port: ${APP_PORT}
-            targetPort: ${APP_PORT}
-        EOF
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: ${APP_PORT}
+          initialDelaySeconds: 45
+          periodSeconds: 10
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /actuator/health
+            port: ${APP_PORT}
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_NAME}
+    build: "${IMAGE_TAG}"
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "${APP_PORT}"
+    prometheus.io/path: "/actuator/prometheus"
+spec:
+  selector:
+    app: ${APP_NAME}
+  type: LoadBalancer
+  ports:
+  - name: http
+    port: 80
+    targetPort: ${APP_PORT}
+  - name: metrics
+    port: ${APP_PORT}
+    targetPort: ${APP_PORT}
+EOF
 
-                        echo "⏳ Waiting for rollout to complete..."
-                        kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=3m
-                    '''
+                            # Apply the deployment
+                            echo "🚀 Applying Kubernetes manifests..."
+                            kubectl apply -f /tmp/deployment.yaml
+
+                            # Wait for rollout
+                            echo "⏳ Waiting for deployment to roll out..."
+                            kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=5m
+
+                            # Get service information
+                            echo "✅ Deployment successful!"
+                            echo "📊 Service information:"
+                            kubectl get svc -n ${NAMESPACE} ${APP_NAME}
+
+                            # Get load balancer URL
+                            LB_URL=\$(kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+                            if [ -n "\$LB_URL" ]; then
+                                echo "🌐 Application URL: http://\$LB_URL"
+                                echo "🏥 Health check: http://\$LB_URL/actuator/health"
+                                echo "📈 Metrics: http://\$LB_URL/actuator/prometheus"
+                            else
+                                echo "⏳ LoadBalancer provisioning in progress..."
+                            fi
+                        """
+                    }
                 }
             }
         }
 
         stage('Verify Deployment') {
-            environment {
-                ECR_CREDS = credentials('aws-credentials')
-            }
             steps {
-                script {
-                    sh '''
-                        #!/bin/bash
-                        set -e
+                withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
+                    script {
+                        sh """#!/bin/bash
+                            echo "🔍 Verifying deployment..."
 
-                        echo "🔍 Verifying deployment..."
+                            # Check pod status
+                            echo "📊 Pod Status:"
+                            kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}
 
-                        # Check pod status
-                        echo "📊 Pod Status:"
-                        kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}
+                            # Check service
+                            echo -e "\n🌐 Service Details:"
+                            kubectl get svc -n ${NAMESPACE} ${APP_NAME}
 
-                        # Check service
-                        echo -e "\n🌐 Service Details:"
-                        kubectl get svc -n ${NAMESPACE} ${APP_NAME}
+                            # Check if all pods are ready
+                            READY_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} | grep Running | wc -l)
+                            TOTAL_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} | tail -n +2 | wc -l)
 
-                        # Get application URL
-                        LB_URL=$(kubectl get svc -n ${NAMESPACE} ${APP_NAME} \
-                            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-
-                        if [ -n "$LB_URL" ]; then
-                            echo -e "\n✅ Application is live at: http://$LB_URL"
-                            echo "   Health endpoint: http://$LB_URL/actuator/health"
-                            echo "   Metrics endpoint: http://$LB_URL/actuator/prometheus"
-
-                            # Test health endpoint
-                            echo -e "\n🏥 Testing health endpoint..."
-                            curl -s -o /dev/null -w "Health check returned: %{http_code}\n" http://$LB_URL/actuator/health || true
-                        else
-                            echo "⏳ LoadBalancer still provisioning..."
-                        fi
-                    '''
+                            if [ "\$READY_PODS" -eq "\$TOTAL_PODS" ] && [ "\$TOTAL_PODS" -gt 0 ]; then
+                                echo "✅ All \$TOTAL_PODS pods are running!"
+                                exit 0
+                            else
+                                echo "❌ Only \$READY_PODS/\$TOTAL_PODS pods are ready"
+                                echo "📝 Recent pod events:"
+                                kubectl describe pods -n ${NAMESPACE} -l app=${APP_NAME} | grep -A10 Events
+                                exit 1
+                            fi
+                        """
+                    }
                 }
             }
         }
@@ -271,64 +284,75 @@ pipeline {
     post {
         success {
             script {
-                echo '✅ Pipeline completed successfully!'
-                withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
+                withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
+                    echo "✅ Pipeline completed successfully!"
+
+                    // Get application URL
                     LB_URL = sh(
                         script: "kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Provisioning'",
                         returnStdout: true
                     ).trim()
 
-                    // Send notification (customize as needed)
+                    // Send notification
                     echo """
-                        🎉 Deployment Successful!
+                        🎉 **DEPLOYMENT SUCCESSFUL** 🎉
+                        =================================
                         Application: ${APP_NAME}
                         Version: ${IMAGE_TAG}
-                        URL: http://${LB_URL}
-                        Health: http://${LB_URL}/actuator/health
-                        Metrics: http://${LB_URL}/actuator/prometheus
                         Namespace: ${NAMESPACE}
                         Cluster: ${EKS_CLUSTER_NAME}
+
+                        📍 Application URL: http://${LB_URL}
+                        🏥 Health Check: http://${LB_URL}/actuator/health
+                        📈 Prometheus Metrics: http://${LB_URL}/actuator/prometheus
+                        =================================
                     """
                 }
             }
         }
 
         failure {
-            echo '❌ Pipeline failed! Running diagnostics...'
-            withAWS(credentials: 'aws-credentials', region: 'eu-central-1') {
-                sh '''
-                    #!/bin/bash
-                    echo "🔍 Gathering failure diagnostics..."
+            script {
+                withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
+                    echo "❌ Pipeline failed! Gathering diagnostics..."
 
-                    # Check if namespace exists
-                    if kubectl get namespace ${NAMESPACE} &>/dev/null; then
-                        echo -e "\n📊 Pod Status:"
-                        kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}
+                    sh """#!/bin/bash
+                        echo "🔍 **DIAGNOSTIC INFORMATION**"
+                        echo "================================"
 
-                        echo -e "\n📝 Pod Events:"
-                        kubectl describe pods -n ${NAMESPACE} -l app=${APP_NAME} | grep -A20 Events
+                        # Check if namespace exists
+                        if kubectl get namespace ${NAMESPACE} &>/dev/null; then
+                            echo "📊 Pod Status in ${NAMESPACE}:"
+                            kubectl get pods -n ${NAMESPACE}
 
-                        echo -e "\n📋 Recent Logs:"
-                        for pod in $(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o name | head -1); do
-                            echo "--- $pod ---"
-                            kubectl logs $pod -n ${NAMESPACE} --tail=30
-                        done
+                            echo -e "\n📝 Recent Pod Events:"
+                            kubectl describe pods -n ${NAMESPACE} | grep -A20 Events
 
-                        echo -e "\n⚙️ Deployment Status:"
-                        kubectl describe deployment ${APP_NAME} -n ${NAMESPACE}
-                    else
-                        echo "Namespace ${NAMESPACE} does not exist yet."
-                    fi
+                            echo -e "\n📋 Recent Logs:"
+                            for pod in \$(kubectl get pods -n ${NAMESPACE} -o name | head -2); do
+                                echo "--- \$pod ---"
+                                kubectl logs \$pod -n ${NAMESPACE} --tail=30
+                            done
 
-                    echo -e "\n📦 ECR Images:"
-                    aws ecr describe-images --repository-name ${ECR_REPOSITORY} --region ${AWS_REGION} \
-                        --query 'imageDetails[*].imageTags' --output table
-                '''
+                            echo -e "\n⚙️ Deployment Status:"
+                            kubectl describe deployment ${APP_NAME} -n ${NAMESPACE}
+                        else
+                            echo "Namespace ${NAMESPACE} does not exist"
+                        fi
+
+                        echo -e "\n📦 Recent Images in ECR:"
+                        aws ecr describe-images --repository-name ${ECR_REPOSITORY} --region ${AWS_REGION} \
+                            --query 'imageDetails[*].{Tags:imageTags, PushedAt:imagePushedAt}' \
+                            --output table | head -20
+
+                        echo "================================"
+                    """
+                }
             }
         }
 
         always {
-            echo '🧹 Cleaning up workspace...'
+            echo "🧹 Cleaning up workspace..."
             cleanWs()
         }
     }
