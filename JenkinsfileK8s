@@ -104,18 +104,23 @@ pipeline {
                         # Create namespace
                         kubectl create namespace qa --dry-run=client -o yaml | kubectl apply -f -
 
-                        # Replace placeholders and deploy
+                        # Create ECR pull secret
+                        kubectl delete secret ecr-pull-secret -n qa --ignore-not-found
+                        kubectl create secret docker-registry ecr-pull-secret \
+                            --docker-server=${ECR_REGISTRY} \
+                            --docker-username=AWS \
+                            --docker-password=\$(aws ecr get-login-password) \
+                            --namespace qa
+
+                        # Deploy application with imagePullSecret
                         sed -e "s|IMAGE_PLACEHOLDER|${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}|g" \
                             -e "s|BUILD_PLACEHOLDER|${BUILD_NUMBER}|g" \
                             deployment.yml | kubectl apply -f -
 
                         kubectl apply -f service.yml
 
-                        # Wait for rollout
-                        kubectl rollout status deployment/orderbook -n qa --timeout=3m
-
-                        # Get service info
-                        kubectl get svc -n qa orderbook-service
+                        # Wait for rollout with more time
+                        kubectl rollout status deployment/orderbook -n qa --timeout=5m
                     """
                 }
             }
