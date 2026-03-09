@@ -10,6 +10,13 @@ public class HomeController {
 	
 	@GetMapping("/")
 	public String hello() {
+
+		try {
+			System.out.println("Testing!!!");
+		}
+		catch(Exception e){
+
+		}
 		return "Welcome to Spring Boot Application!!";
 	}
 	
