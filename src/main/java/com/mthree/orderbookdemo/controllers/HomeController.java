@@ -10,7 +10,7 @@ public class HomeController {
 	
 	@GetMapping("/")
 	public String home() {
-		return "Spring Boot Application with Monitoring and Alerting!!";
+		return "Welcome to Spring Boot Application!!";
 	}
 	
 	
