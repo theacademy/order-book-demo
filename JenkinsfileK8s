@@ -8,7 +8,6 @@ pipeline {
         AWS_ACCOUNT_ID = '271758791556'
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         ECR_REPOSITORY = 'orderbook-tomcat'
-        IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
         APP_NAME = 'orderbook'
         NAMESPACE = 'qa'
         APP_PORT = '8085'
@@ -22,16 +21,16 @@ pipeline {
         jdk 'JAVA_HOME'
     }
 
-    stage('Checkout') {
-        steps {
-            git url: 'https://github.com/theacademy/order-book-demo.git'
-            script {
-                // Use env. to avoid the warning
-                env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                echo "Git commit: ${env.GIT_COMMIT_SHORT}"
+    stages {
+        stage('Checkout') {
+            steps {
+                git url: 'https://github.com/theacademy/order-book-demo.git'
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    echo "Git commit: ${env.GIT_COMMIT_SHORT}"
+                }
             }
         }
-    }
 
         stage('Build & Test') {
             parallel {
@@ -54,10 +53,7 @@ pipeline {
 
                 stage('Test with Coverage') {
                     steps {
-                        // This will run tests and generate Clover coverage
                         sh 'mvn test -Pcoverage'
-
-                        // Generate Clover report
                         sh 'mvn clover:clover clover:aggregate -Pcoverage'
                     }
                 }
@@ -66,10 +62,8 @@ pipeline {
 
         stage('Publish Test & Coverage Reports') {
             steps {
-                // Publish JUnit test results
                 junit 'target/surefire-reports/*.xml'
 
-                // Publish Clover coverage report
                 clover(
                     cloverReportDir: 'target/site/clover',
                     cloverReportFileName: 'clover.xml',
@@ -78,24 +72,9 @@ pipeline {
                     failingTarget: [methodCoverage: 0, conditionalCoverage: 0, statementCoverage: 0]
                 )
 
-                script {
-                    // Check if HTML Publisher plugin is available
-                    def hasHtmlPublisher = Jenkins.instance.pluginManager.getPlugin('htmlpublisher')?.isEnabled() ?: false
-
-                    if (hasHtmlPublisher) {
-                        publishHTML([
-                            allowMissing: false,
-                            alwaysLinkToLastBuild: true,
-                            keepAll: true,
-                            reportDir: 'target/site/clover',
-                            reportFiles: 'index.html',
-                            reportName: 'Clover Coverage Report'
-                        ])
-                    } else {
-                        echo "HTML Publisher plugin not installed. Archiving HTML report instead."
-                        archiveArtifacts artifacts: 'target/site/clover/**', fingerprint: true
-                    }
-                }
+                // Archive HTML reports - no script security issues
+                archiveArtifacts artifacts: 'target/site/clover/**', fingerprint: true
+                echo "✅ Clover HTML report archived in build artifacts"
             }
         }
 
@@ -109,17 +88,20 @@ pipeline {
             steps {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
                     script {
+                        // Use GIT_COMMIT_SHORT from environment
+                        def imageTag = "${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+
                         sh """
                             # Login to ECR
                             aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
                             # Build Docker image with build args
-                            docker build --build-arg JAR_FILE=target/orderbook.war \
-                                        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
+                            docker build --build-arg JAR_FILE=target/orderbook.war \\
+                                        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag} \\
                                         -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
 
                             # Push images to ECR
-                            docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+                            docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag}
                             docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
                         """
                     }
@@ -131,6 +113,8 @@ pipeline {
             steps {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
                     script {
+                        def imageTag = "${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+
                         sh """#!/bin/bash
                             set -e
 
@@ -146,10 +130,10 @@ pipeline {
                             echo "🔑 Creating ECR pull secret..."
                             kubectl delete secret ecr-pull-secret -n ${NAMESPACE} --ignore-not-found
                             ECR_PASSWORD=\$(aws ecr get-login-password --region ${AWS_REGION})
-                            kubectl create secret docker-registry ecr-pull-secret \
-                                --docker-server=${ECR_REGISTRY} \
-                                --docker-username=AWS \
-                                --docker-password="\${ECR_PASSWORD}" \
+                            kubectl create secret docker-registry ecr-pull-secret \\
+                                --docker-server=${ECR_REGISTRY} \\
+                                --docker-username=AWS \\
+                                --docker-password="\${ECR_PASSWORD}" \\
                                 --namespace ${NAMESPACE}
 
                             # Create temporary deployment file
@@ -162,7 +146,7 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     app: ${APP_NAME}
-    build: "${IMAGE_TAG}"
+    build: ${imageTag}
 spec:
   replicas: 2
   selector:
@@ -172,7 +156,7 @@ spec:
     metadata:
       labels:
         app: ${APP_NAME}
-        build: "${IMAGE_TAG}"
+        build: ${imageTag}
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "${APP_PORT}"
@@ -182,7 +166,7 @@ spec:
       - name: ecr-pull-secret
       containers:
       - name: ${APP_NAME}
-        image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
+        image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag}
         ports:
         - containerPort: ${APP_PORT}
         env:
@@ -191,7 +175,7 @@ spec:
         - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
           value: "prometheus,health,info,metrics"
         - name: BUILD_NUMBER
-          value: "${IMAGE_TAG}"
+          value: "${imageTag}"
         - name: SPRING_PROFILES_ACTIVE
           value: "production"
         - name: SERVER_PORT
@@ -234,7 +218,7 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     app: ${APP_NAME}
-    build: "${IMAGE_TAG}"
+    build: ${imageTag}
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/port: "${APP_PORT}"
@@ -296,8 +280,8 @@ EOF
                             kubectl get svc -n ${NAMESPACE} ${APP_NAME}
 
                             # Check if all pods are ready
-                            READY_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} | grep Running | wc -l)
-                            TOTAL_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} | tail -n +2 | wc -l)
+                            READY_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} --field-selector status.phase=Running | grep -v NAME | wc -l)
+                            TOTAL_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} --no-headers | wc -l)
 
                             if [ "\$READY_PODS" -eq "\$TOTAL_PODS" ] && [ "\$TOTAL_PODS" -gt 0 ]; then
                                 echo "✅ All \$TOTAL_PODS pods are running!"
@@ -330,14 +314,14 @@ EOF
                         🎉 **DEPLOYMENT SUCCESSFUL** 🎉
                         =================================
                         Application: ${APP_NAME}
-                        Version: ${IMAGE_TAG}
+                        Version: ${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}
                         Namespace: ${NAMESPACE}
                         Cluster: ${EKS_CLUSTER_NAME}
 
                         📍 Application URL: http://${LB_URL}
                         🏥 Health Check: http://${LB_URL}/actuator/health
                         📈 Prometheus Metrics: http://${LB_URL}/actuator/prometheus
-                        📊 Clover Coverage: ${BUILD_URL}Clover_Coverage_Report/
+                        📊 Clover Coverage: ${BUILD_URL}artifact/target/site/clover/index.html
                         =================================
                     """
                 }
@@ -374,8 +358,8 @@ EOF
                         fi
 
                         echo -e "\n📦 Recent Images in ECR:"
-                        aws ecr describe-images --repository-name ${ECR_REPOSITORY} --region ${AWS_REGION} \
-                            --query 'imageDetails[*].{Tags:imageTags, PushedAt:imagePushedAt}' \
+                        aws ecr describe-images --repository-name ${ECR_REPOSITORY} --region ${AWS_REGION} \\
+                            --query 'imageDetails[*].{Tags:imageTags, PushedAt:imagePushedAt}' \\
                             --output table | head -20
 
                         echo "================================"
