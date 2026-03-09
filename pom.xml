@@ -29,6 +29,7 @@
     </scm>
     <properties>
         <java.version>21</java.version>
+        <jacoco.version>0.8.11</jacoco.version>
     </properties>
     <dependencies>
         <dependency>
@@ -70,15 +71,6 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- Clover dependency for test runtime -->
-        <dependency>
-            <groupId>org.openclover</groupId>
-            <artifactId>clover</artifactId>
-            <version>4.4.1</version>
-            <scope>test</scope>
-        </dependency>
-
-
         <!-- Spring Boot Actuator - exposes metrics endpoints -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -114,42 +106,52 @@
                     <target>21</target>
                 </configuration>
             </plugin>
+            <!-- JaCoCo Plugin -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>${jacoco.version}</version>
+                <executions>
+                    <execution>
+                        <id>prepare-agent</id>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
-
         <finalName>orderbook</finalName>
-
     </build>
 
     <profiles>
-        <!-- Profile for code coverage with OpenClover -->
+        <!-- Profile for code coverage with JaCoCo -->
         <profile>
             <id>coverage</id>
             <build>
                 <plugins>
                     <plugin>
-                        <groupId>org.openclover</groupId>
-                        <artifactId>clover-maven-plugin</artifactId>
-                        <version>4.4.1</version>
-                        <configuration>
-                            <generateHtml>true</generateHtml>
-                            <generateXml>true</generateXml>
-                            <includesTestSourceRoots>true</includesTestSourceRoots>  <!-- This is key! -->
-
-                        </configuration>
+                        <groupId>org.jacoco</groupId>
+                        <artifactId>jacoco-maven-plugin</artifactId>
                         <executions>
                             <execution>
-                                <id>clover-setup</id>
-                                <phase>process-test-classes</phase>
+                                <id>prepare-agent</id>
                                 <goals>
-                                    <goal>setup</goal>
+                                    <goal>prepare-agent</goal>
                                 </goals>
                             </execution>
                             <execution>
-                                <id>clover-report</id>
-                                <phase>verify</phase>
+                                <id>report</id>
+                                <phase>test</phase>
                                 <goals>
-                                    <goal>clover</goal>
-                                    <goal>aggregate</goal>
+                                    <goal>report</goal>
                                 </goals>
                             </execution>
                         </executions>

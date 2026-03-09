@@ -53,14 +53,8 @@ pipeline {
 
                 stage('Test with Coverage') {
                     steps {
-                        // First, clean and compile normally
-                        sh 'mvn clean compile'
-
-                        // Then instrument with Clover and test
-                        sh 'mvn clover:instrument test -Pcoverage'
-
-                        // Finally generate the report
-                        sh 'mvn clover:clover -Pcoverage'
+                        // Run tests with JaCoCo coverage (single command, no separate instrumentation)
+                        sh 'mvn clean test jacoco:report -Pcoverage'
                     }
                 }
             }
@@ -68,19 +62,22 @@ pipeline {
 
         stage('Publish Test & Coverage Reports') {
             steps {
+                // Publish JUnit test results
                 junit 'target/surefire-reports/*.xml'
 
-                clover(
-                    cloverReportDir: 'target/site/clover',
-                    cloverReportFileName: 'clover.xml',
-                    healthyTarget: [methodCoverage: 70, conditionalCoverage: 70, statementCoverage: 70],
-                    unhealthyTarget: [methodCoverage: 50, conditionalCoverage: 50, statementCoverage: 50],
-                    failingTarget: [methodCoverage: 0, conditionalCoverage: 0, statementCoverage: 0]
+                // Publish JaCoCo coverage report using the modern Coverage Plugin
+                // Note: Install "Coverage Plugin" in Jenkins (deprecated JaCoCo plugin replaced)
+                recordCoverage(
+                    tools: [[
+                        parser: 'JACOCO',
+                        pattern: 'target/site/jacoco/jacoco.xml'
+                    ]],
+                    sourceCodeRetention: 'MODIFIED'
                 )
 
-                // Archive HTML reports - no script security issues
-                archiveArtifacts artifacts: 'target/site/clover/**', fingerprint: true
-                echo "✅ Clover HTML report archived in build artifacts"
+                // Archive HTML reports
+                archiveArtifacts artifacts: 'target/site/jacoco/**', fingerprint: true
+                echo "✅ JaCoCo HTML report archived in build artifacts"
             }
         }
 
@@ -327,7 +324,7 @@ EOF
                         📍 Application URL: http://${LB_URL}
                         🏥 Health Check: http://${LB_URL}/actuator/health
                         📈 Prometheus Metrics: http://${LB_URL}/actuator/prometheus
-                        📊 Clover Coverage: ${BUILD_URL}artifact/target/site/clover/index.html
+                        📊 JaCoCo Coverage: ${BUILD_URL}artifact/target/site/jacoco/index.html
                         =================================
                     """
                 }
@@ -377,7 +374,7 @@ EOF
         always {
             // Archive test results and coverage reports
             junit 'target/surefire-reports/*.xml'
-            archiveArtifacts artifacts: 'target/site/clover/**', fingerprint: true
+            archiveArtifacts artifacts: 'target/site/jacoco/**', fingerprint: true
 
             echo "🧹 Cleaning up workspace..."
             cleanWs()
