@@ -53,8 +53,14 @@ pipeline {
 
                 stage('Test with Coverage') {
                     steps {
-                        // Run tests with Clover instrumentation (CORRECT ORDER)
-                        sh 'mvn clean clover:instrument test clover:clover -Pcoverage'
+                        // First, clean and compile normally
+                        sh 'mvn clean compile'
+
+                        // Then instrument with Clover and test
+                        sh 'mvn clover:instrument test -Pcoverage'
+
+                        // Finally generate the report
+                        sh 'mvn clover:clover -Pcoverage'
                     }
                 }
             }
