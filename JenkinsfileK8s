@@ -22,15 +22,16 @@ pipeline {
         jdk 'JAVA_HOME'
     }
 
-    stages {
-        stage('Checkout') {
-            steps {
-                git url: 'https://github.com/theacademy/order-book-demo.git'
-                script {
-                    GIT_COMMIT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
-                }
+    stage('Checkout') {
+        steps {
+            git url: 'https://github.com/theacademy/order-book-demo.git'
+            script {
+                // Use env. to avoid the warning
+                env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                echo "Git commit: ${env.GIT_COMMIT_SHORT}"
             }
         }
+    }
 
         stage('Build & Test') {
             parallel {
@@ -208,23 +209,23 @@ spec:
           httpGet:
             path: /actuator/health
             port: ${APP_PORT}
-          initialDelaySeconds: 60
-          periodSeconds: 10
+          initialDelaySeconds: 120
+          periodSeconds: 20
           failureThreshold: 3
         readinessProbe:
           httpGet:
             path: /actuator/health
             port: ${APP_PORT}
-          initialDelaySeconds: 45
-          periodSeconds: 10
+          initialDelaySeconds: 60
+          periodSeconds: 15
           failureThreshold: 3
         startupProbe:
           httpGet:
             path: /actuator/health
             port: ${APP_PORT}
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          failureThreshold: 30
+          initialDelaySeconds: 40
+          periodSeconds: 20
+          failureThreshold: 12
 ---
 apiVersion: v1
 kind: Service
