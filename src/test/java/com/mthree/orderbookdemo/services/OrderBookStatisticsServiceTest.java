@@ -5,11 +5,14 @@ import com.mthree.orderbookdemo.models.OrderType;
 import com.mthree.orderbookdemo.models.Trade;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import java.math.BigDecimal;
 import java.util.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@DisplayName("Order Book Statistics Service Tests")
 class OrderBookStatisticsServiceTest {
 
     private OrderBookStatisticsService statisticsService;
@@ -20,6 +23,7 @@ class OrderBookStatisticsServiceTest {
     }
 
     @Test
+    @DisplayName("Should calculate total volume correctly")
     void shouldCalculateTotalVolume() {
         List<Trade> trades = createSampleTrades();
 
@@ -30,6 +34,7 @@ class OrderBookStatisticsServiceTest {
     }
 
     @Test
+    @DisplayName("Should calculate VWAP correctly")
     void shouldCalculateVWAP() {
         List<Trade> trades = createSampleTrades();
 
@@ -40,6 +45,7 @@ class OrderBookStatisticsServiceTest {
     }
 
     @Test
+    @DisplayName("Should calculate order imbalance correctly")
     void shouldCalculateOrderImbalance() {
         List<Order> orders = Arrays.asList(
                 createOrder(OrderType.BUY),
@@ -57,6 +63,7 @@ class OrderBookStatisticsServiceTest {
     }
 
     @Test
+    @DisplayName("Should get price levels with mixed orders")
     void shouldGetPriceLevelsWithMixedOrders() {
         List<Order> orders = Arrays.asList(
                 createOrderWithPriceAndQuantity(OrderType.BUY, new BigDecimal("150.50"), 25),
@@ -89,6 +96,7 @@ class OrderBookStatisticsServiceTest {
     }
 
     @Test
+    @DisplayName("Should handle empty list for price levels")
     void shouldHandleEmptyListForPriceLevels() {
         Map<String, Object> priceLevels = statisticsService.getPriceLevels(Collections.emptyList(), 5);
 
@@ -97,6 +105,7 @@ class OrderBookStatisticsServiceTest {
     }
 
     @Test
+    @DisplayName("Should handle null list for price levels")
     void shouldHandleNullListForPriceLevels() {
         Map<String, Object> priceLevels = statisticsService.getPriceLevels(null, 5);
 
@@ -105,6 +114,7 @@ class OrderBookStatisticsServiceTest {
     }
 
     @Test
+    @DisplayName("Should calculate bid and ask levels correctly")
     void shouldCalculateBidAndAskLevels() {
         List<Order> buyOrders = Arrays.asList(
                 createOrderWithPriceAndQuantity(OrderType.BUY, new BigDecimal("100.00"), 10),
@@ -145,6 +155,7 @@ class OrderBookStatisticsServiceTest {
     }
 
     @Test
+    @DisplayName("Should calculate spread correctly")
     void shouldCalculateSpread() {
         List<Order> buyOrders = Arrays.asList(
                 createOrderWithPriceAndQuantity(OrderType.BUY, new BigDecimal("100.00"), 10),
