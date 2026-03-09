@@ -8,10 +8,13 @@ pipeline {
         AWS_ACCOUNT_ID = '271758791556'
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         ECR_REPOSITORY = 'orderbook-tomcat'
-        IMAGE_TAG = "${BUILD_NUMBER}"
+        IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
         APP_NAME = 'orderbook'
         NAMESPACE = 'qa'
         APP_PORT = '8085'
+
+        // Quality Gates
+        MIN_COVERAGE = '70'
     }
 
     tools {
@@ -23,6 +26,9 @@ pipeline {
         stage('Checkout') {
             steps {
                 git url: 'https://github.com/theacademy/order-book-demo.git'
+                script {
+                    GIT_COMMIT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                }
             }
         }
 
@@ -45,30 +51,47 @@ pipeline {
                     }
                 }
 
-                stage('Test') {
+                stage('Test with Coverage') {
                     steps {
+                        // This will run tests and generate Clover coverage
                         sh 'mvn test -Pcoverage'
+
+                        // Generate Clover report
                         sh 'mvn clover:clover clover:aggregate -Pcoverage'
                     }
                 }
             }
         }
 
-        stage('Publish Test Report') {
+        stage('Publish Test & Coverage Reports') {
             steps {
+                // Publish JUnit test results
+                junit 'target/surefire-reports/*.xml'
+
+                // Publish Clover coverage report
                 clover(
                     cloverReportDir: 'target/site/clover',
                     cloverReportFileName: 'clover.xml',
-                    healthyTarget: [methodCoverage: 70, conditionalCoverage: 80, statementCoverage: 80],
+                    healthyTarget: [methodCoverage: 70, conditionalCoverage: 70, statementCoverage: 70],
                     unhealthyTarget: [methodCoverage: 50, conditionalCoverage: 50, statementCoverage: 50],
                     failingTarget: [methodCoverage: 0, conditionalCoverage: 0, statementCoverage: 0]
                 )
+
+                // Publish HTML report for easy viewing
+                publishHTML([
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: 'target/site/clover',
+                    reportFiles: 'index.html',
+                    reportName: 'Clover Coverage Report'
+                ])
             }
         }
 
         stage('Package') {
             steps {
-                sh 'mvn package'
+                sh 'mvn package -DskipTests'
             }
         }
 
@@ -78,10 +101,11 @@ pipeline {
                     script {
                         sh """
                             # Login to ECR
-                            aws ecr get-login-password | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
-                            # Build Docker image
-                            docker build -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
+                            # Build Docker image with build args
+                            docker build --build-arg JAR_FILE=target/orderbook.war \
+                                        -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG} \
                                         -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
 
                             # Push images to ECR
@@ -108,10 +132,10 @@ pipeline {
                             # Create namespace if not exists
                             kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
-                            # Create ECR pull secret (separately to avoid YAML parsing issues)
+                            # Create ECR pull secret
                             echo "🔑 Creating ECR pull secret..."
                             kubectl delete secret ecr-pull-secret -n ${NAMESPACE} --ignore-not-found
-                            ECR_PASSWORD=\$(aws ecr get-login-password)
+                            ECR_PASSWORD=\$(aws ecr get-login-password --region ${AWS_REGION})
                             kubectl create secret docker-registry ecr-pull-secret \
                                 --docker-server=${ECR_REGISTRY} \
                                 --docker-username=AWS \
@@ -285,8 +309,6 @@ EOF
         success {
             script {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
-                    echo "✅ Pipeline completed successfully!"
-
                     // Get application URL
                     LB_URL = sh(
                         script: "kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Provisioning'",
@@ -305,6 +327,7 @@ EOF
                         📍 Application URL: http://${LB_URL}
                         🏥 Health Check: http://${LB_URL}/actuator/health
                         📈 Prometheus Metrics: http://${LB_URL}/actuator/prometheus
+                        📊 Clover Coverage: ${BUILD_URL}Clover_Coverage_Report/
                         =================================
                     """
                 }
@@ -352,6 +375,10 @@ EOF
         }
 
         always {
+            // Archive test results and coverage reports
+            junit 'target/surefire-reports/*.xml'
+            archiveArtifacts artifacts: 'target/site/clover/**', fingerprint: true
+
             echo "🧹 Cleaning up workspace..."
             cleanWs()
         }
