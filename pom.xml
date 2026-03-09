@@ -133,6 +133,8 @@
                         <configuration>
                             <generateHtml>true</generateHtml>
                             <generateXml>true</generateXml>
+                            <includesTestSourceRoots>true</includesTestSourceRoots>  <!-- This is key! -->
+
                         </configuration>
                         <executions>
                             <execution>
