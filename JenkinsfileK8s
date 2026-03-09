@@ -77,15 +77,24 @@ pipeline {
                     failingTarget: [methodCoverage: 0, conditionalCoverage: 0, statementCoverage: 0]
                 )
 
-                // Publish HTML report for easy viewing
-                publishHTML([
-                    allowMissing: false,
-                    alwaysLinkToLastBuild: true,
-                    keepAll: true,
-                    reportDir: 'target/site/clover',
-                    reportFiles: 'index.html',
-                    reportName: 'Clover Coverage Report'
-                ])
+                script {
+                    // Check if HTML Publisher plugin is available
+                    def hasHtmlPublisher = Jenkins.instance.pluginManager.getPlugin('htmlpublisher')?.isEnabled() ?: false
+
+                    if (hasHtmlPublisher) {
+                        publishHTML([
+                            allowMissing: false,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: true,
+                            reportDir: 'target/site/clover',
+                            reportFiles: 'index.html',
+                            reportName: 'Clover Coverage Report'
+                        ])
+                    } else {
+                        echo "HTML Publisher plugin not installed. Archiving HTML report instead."
+                        archiveArtifacts artifacts: 'target/site/clover/**', fingerprint: true
+                    }
+                }
             }
         }
 
