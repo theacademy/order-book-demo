@@ -1,0 +1,319 @@
+pipeline {
+    agent {
+        // Use a dedicated CI agent with limited permissions
+        label 'ci-secure-agent'
+    }
+
+    environment {
+        // Use Jenkins credentials for ALL sensitive values
+        AWS_ACCOUNT_ID = credentials('aws-account-id')
+        AWS_REGION = credentials('aws-region')
+        EKS_CLUSTER_NAME = credentials('eks-cluster-name')
+        ECR_REPOSITORY = credentials('ecr-repository')
+
+        // Build ECR registry URL dynamically
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        // Non-sensitive values
+        APP_NAME = 'orderbook'
+        NAMESPACE = "qa-${BUILD_NUMBER}" // Use unique namespace for isolation
+        APP_PORT = '8085'
+        MIN_COVERAGE = '70'
+
+        // Git branch validation (prevent injection)
+        SAFE_BRANCH = "${env.BRANCH_NAME?.replaceAll('[^a-zA-Z0-9-]', '-') ?: 'unknown'}"
+
+        // Use temporary role with minimal permissions
+        CI_ROLE_ARN = credentials('ci-role-arn')
+    }
+
+    tools {
+        maven 'MAVEN_HOME'
+        jdk 'JAVA_HOME'
+    }
+
+    stages {
+        stage('Security Validation') {
+            steps {
+                script {
+                    // Validate git branch to prevent injection
+                    if (env.BRANCH_NAME && env.BRANCH_NAME =~ /[;&|`\$]/) {
+                        error "Invalid branch name detected: ${env.BRANCH_NAME}"
+                    }
+
+                    // Verify AWS credentials are properly set
+                    if (!env.AWS_ACCOUNT_ID || env.AWS_ACCOUNT_ID == 'null') {
+                        error "AWS_ACCOUNT_ID not properly configured in Jenkins credentials"
+                    }
+
+                    echo "Security validation passed"
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                // Use credential for git operations
+                git(
+                    url: 'https://github.com/theacademy/order-book-demo.git',
+                    branch: env.BRANCH_NAME,
+                    credentialsId: 'github-credentials'
+                )
+                script {
+                    // Validate and sanitize git commit SHA
+                    def rawCommit = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    if (!rawCommit.matches('^[a-f0-9]{7,40}$')) {
+                        error "Invalid git commit SHA: ${rawCommit}"
+                    }
+                    env.GIT_COMMIT_SHORT = rawCommit
+
+                    // Scan for secrets in code
+                    sh """
+                        # Run trufflehog to detect secrets
+                        docker run --rm -v $(pwd):/repo trufflesecurity/trufflehog:latest \
+                            filesystem /repo --no-update --only-verified --fail
+                    """
+
+                    echo "Git commit: ${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        stage('Build & Test') {
+            parallel {
+                stage('Compile') {
+                    steps {
+                        // Run in isolated container
+                        sh 'docker run --rm -v $(pwd):/workspace maven:3.8-openjdk-11-slim sh -c "cd /workspace && mvn compile"'
+                    }
+                }
+
+                stage('Code Review') {
+                    steps {
+                        sh 'mvn pmd:pmd'
+                    }
+                    post {
+                        success {
+                            recordIssues enabledForFailure: true, tool: pmdParser(pattern: '**/target/pmd.xml')
+                        }
+                    }
+                }
+
+                stage('Test with Coverage') {
+                    steps {
+                        sh 'mvn clean test jacoco:report -Pcoverage'
+                    }
+                }
+            }
+        }
+
+        stage('Security Scanning') {
+            parallel {
+                stage('SAST - SonarQube') {
+                    steps {
+                        script {
+                            withSonarQubeEnv('SonarQube') {
+                                sh """
+                                    mvn sonar:sonar \
+                                        -Dsonar.projectKey=${JOB_NAME} \
+                                        -Dsonar.projectName=${APP_NAME} \
+                                        -Dsonar.projectVersion=${BUILD_NUMBER}
+                                """
+                            }
+                        }
+                    }
+                }
+
+                stage('Dependency Scanning') {
+                    steps {
+                        sh """
+                            # OWASP Dependency Check
+                            mvn org.owasp:dependency-check-maven:check \
+                                -DfailOnError=true \
+                                -DfailBuildOnCVSS=7
+
+                            # Snyk for vulnerability scanning
+                            snyk test --all-projects --severity-threshold=high
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    // Wait for SonarQube analysis
+                    timeout(time: 10, unit: 'MINUTES') {
+                        waitForQualityGate abortPipeline: true
+                    }
+
+                    // Validate coverage
+                    def coverage = sh(
+                        script: "grep -oP 'ctr2=\"\\K[0-9]+' target/site/jacoco/jacoco.xml | head -1",
+                        returnStdout: true
+                    ).trim()
+
+                    if (coverage.toInteger() < MIN_COVERAGE.toInteger()) {
+                        error "Coverage ${coverage}% below threshold ${MIN_COVERAGE}%"
+                    }
+                }
+            }
+        }
+
+        stage('Package') {
+            steps {
+                sh 'mvn package -DskipTests'
+
+                // Generate checksum for integrity verification
+                sh 'sha256sum target/orderbook.war > target/orderbook.war.sha256'
+            }
+        }
+
+        stage('Container Image Security') {
+            steps {
+                script {
+                    def imageTag = "${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+                    def tempImageName = "temp-${APP_NAME}:${imageTag}"
+
+                    sh """
+                        # Build temporary image for scanning
+                        docker build --build-arg JAR_FILE=target/orderbook.war -t ${tempImageName} .
+
+                        # Run Trivy security scan (fail on critical/high)
+                        trivy image --severity HIGH,CRITICAL --exit-code 1 ${tempImageName}
+
+                        # Run Docker Bench Security
+                        docker run --rm --net host --pid host --userns host \
+                            --cap-add audit_control \
+                            -e DOCKER_CONTENT_TRUST=1 \
+                            -v /etc:/etc:ro \
+                            -v /var/lib:/var/lib:ro \
+                            docker/docker-bench-security
+
+                        # Clean up
+                        docker rmi ${tempImageName}
+                    """
+                }
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                // Use IAM role with minimal permissions (assume role)
+                withAWS(
+                    credentials: 'aws-credentials-ci',
+                    region: "${AWS_REGION}",
+                    roleArn: "${CI_ROLE_ARN}",
+                    roleSessionName: "jenkins-ci-${BUILD_NUMBER}"
+                ) {
+                    script {
+                        def imageTag = "${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+                        def imageDigest = ""
+
+                        sh """
+                            # Login to ECR
+                            aws ecr get-login-password --region ${AWS_REGION} | \
+                                docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                            # Build with labels for traceability
+                            docker build \
+                                --build-arg JAR_FILE=target/orderbook.war \
+                                --label "build.id=${BUILD_NUMBER}" \
+                                --label "build.commit=${env.GIT_COMMIT_SHORT}" \
+                                --label "build.branch=${SAFE_BRANCH}" \
+                                --label "build.date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+                                --label "build.jenkins.url=${BUILD_URL}" \
+                                -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag} .
+
+                            # Push only versioned tag (no 'latest' to avoid confusion)
+                            docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag}
+
+                            # Get image digest for immutable reference
+                            docker inspect ${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag} | \
+                                jq -r '.[0].RepoDigests[0]' > image-digest.txt
+                        """
+
+                        imageDigest = readFile('image-digest.txt').trim()
+
+                        // Store image metadata for audit
+                        def metadata = """
+                        {
+                            "buildNumber": "${BUILD_NUMBER}",
+                            "gitCommit": "${env.GIT_COMMIT_SHORT}",
+                            "gitBranch": "${SAFE_BRANCH}",
+                            "imageTag": "${imageTag}",
+                            "imageDigest": "${imageDigest}",
+                            "timestamp": "${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'")}",
+                            "jenkinsBuildUrl": "${BUILD_URL}",
+                            "jenkinsJob": "${JOB_NAME}"
+                        }
+                        """
+                        writeFile file: 'image-metadata.json', text: metadata
+                        archiveArtifacts artifacts: 'image-metadata.json, image-digest.txt'
+
+                        // Stash for later stages
+                        stash name: 'image-metadata', includes: 'image-metadata.json'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                // Get image metadata
+                unstash 'image-metadata'
+                def metadata = readJSON file: 'image-metadata.json'
+
+                // Trigger CD pipeline via secure webhook
+                withCredentials([string(credentialsId: 'spinnaker-webhook-token', variable: 'WEBHOOK_TOKEN')]) {
+                    sh """
+                        curl -X POST \
+                            -H "Content-Type: application/json" \
+                            -H "Authorization: Bearer ${WEBHOOK_TOKEN}" \
+                            -d '${metadata}' \
+                            "${SPINNAKER_WEBHOOK_URL}/api/webhooks/jenkins"
+                    """
+                }
+
+                // Send minimal, secure notification
+                emailext(
+                    subject: "[SUCCESS] ${JOB_NAME} - Build #${BUILD_NUMBER}",
+                    body: """
+                        Build successful
+                        Commit: ${env.GIT_COMMIT_SHORT}
+                        Image: ${metadata.imageDigest}
+                        ${BUILD_URL}
+                    """,
+                    to: 'devops-team@company.com',
+                    recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+                )
+            }
+        }
+
+        failure {
+            script {
+                emailext(
+                    subject: "[FAILED] ${JOB_NAME} - Build #${BUILD_NUMBER}",
+                    body: "Build failed. Check Jenkins for details: ${BUILD_URL}",
+                    to: 'devops-team@company.com'
+                )
+            }
+        }
+
+        always {
+            // Secure cleanup
+            script {
+                // Remove any sensitive files
+                sh 'find . -name "*.secret" -delete 2>/dev/null || true'
+                sh 'find . -name "*.key" -delete 2>/dev/null || true'
+                sh 'find . -name "*password*" -delete 2>/dev/null || true'
+
+                // Clean workspace
+                cleanWs()
+            }
+        }
+    }
+}
