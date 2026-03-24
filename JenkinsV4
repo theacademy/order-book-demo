@@ -1,0 +1,280 @@
+pipeline {
+    agent any
+
+    environment {
+        // Map branch to environment (master=prod, uat=uat, develop=dev)
+        ENV = "${env.BRANCH_NAME == 'master' ? 'prod' : (env.BRANCH_NAME == 'uat' ? 'uat' : 'dev')}"
+
+        // Application configuration
+        APP_NAME = 'orderbook'
+        APP_PORT = '8085'
+        MIN_COVERAGE = '70'
+
+        // Environment-specific namespace
+        NAMESPACE = "${ENV}"
+
+        // Environment-specific configurations
+        REPLICAS = "${ENV == 'prod' ? '5' : (ENV == 'uat' ? '3' : '2')}"
+
+        // AWS Configuration - Use credentials per environment
+        // Note: You need to create these credentials in Jenkins
+        AWS_REGION = credentials("aws-region-${ENV}")
+        EKS_CLUSTER_NAME = credentials("eks-cluster-${ENV}")
+        AWS_ACCOUNT_ID = credentials("aws-account-id-${ENV}")
+        ECR_REPOSITORY = credentials("ecr-repository-${ENV}")
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        // Git branch validation
+        SAFE_BRANCH = "${env.BRANCH_NAME?.replaceAll('[^a-zA-Z0-9-]', '-') ?: 'unknown'}"
+    }
+
+    tools {
+        maven 'MAVEN_HOME'
+        jdk 'JAVA_HOME'
+    }
+
+    stages {
+        stage('Environment Validation') {
+            steps {
+                script {
+                    echo """
+                    ============================================
+                    DEPLOYMENT CONFIGURATION
+                    ============================================
+                    Environment: ${ENV}
+                    Branch: ${env.BRANCH_NAME}
+                    Namespace: ${NAMESPACE}
+                    Cluster: ${EKS_CLUSTER_NAME}
+                    Replicas: ${REPLICAS}
+                    ============================================
+                    """
+
+                    // Validate branch-environment mapping
+                    if (ENV == 'prod' && env.BRANCH_NAME != 'master') {
+                        error "Production deployments only allowed from 'master' branch. Current branch: ${env.BRANCH_NAME}"
+                    }
+                    if (ENV == 'uat' && env.BRANCH_NAME != 'uat') {
+                        error "UAT deployments only allowed from 'uat' branch. Current branch: ${env.BRANCH_NAME}"
+                    }
+                    if (ENV == 'dev' && !(env.BRANCH_NAME in ['develop', 'dev']) && !env.BRANCH_NAME.startsWith('feature/')) {
+                        echo "Note: Dev deployments from branch: ${env.BRANCH_NAME}"
+                    }
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                git(
+                    url: 'https://github.com/theacademy/order-book-demo.git',
+                    branch: env.BRANCH_NAME,
+                    credentialsId: 'github-credentials'
+                )
+                script {
+                    env.GIT_COMMIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    echo "Git commit: ${env.GIT_COMMIT_SHORT}"
+                }
+            }
+        }
+
+        stage('Build & Test') {
+            when {
+                // Skip full build/test for production
+                expression { ENV != 'prod' }
+            }
+            parallel {
+                stage('Compile') {
+                    steps {
+                        sh 'mvn compile'
+                    }
+                }
+
+                stage('Code Review') {
+                    steps {
+                        sh 'mvn pmd:pmd'
+                    }
+                    post {
+                        success {
+                            recordIssues enabledForFailure: true, tool: pmdParser(pattern: '**/target/pmd.xml')
+                        }
+                    }
+                }
+
+                stage('Test with Coverage') {
+                    steps {
+                        sh 'mvn clean test jacoco:report -Pcoverage'
+                    }
+                }
+            }
+        }
+
+        stage('Publish Test & Coverage Reports') {
+            when {
+                expression { ENV != 'prod' }
+            }
+            steps {
+                junit 'target/surefire-reports/*.xml'
+                recordCoverage(
+                    tools: [[
+                        parser: 'JACOCO',
+                        pattern: 'target/site/jacoco/jacoco.xml'
+                    ]],
+                    sourceCodeRetention: 'MODIFIED'
+                )
+                archiveArtifacts artifacts: 'target/site/jacoco/**', fingerprint: true
+
+                script {
+                    def coverage = sh(
+                        script: "grep -oP 'ctr2=\"\\K[0-9]+' target/site/jacoco/jacoco.xml | head -1",
+                        returnStdout: true
+                    ).trim()
+
+                    if (coverage && coverage.toInteger() < MIN_COVERAGE.toInteger()) {
+                        error "Coverage ${coverage}% is below threshold ${MIN_COVERAGE}%"
+                    }
+                    echo "Coverage: ${coverage}% - Threshold passed"
+                }
+            }
+        }
+
+        stage('Package') {
+            when {
+                expression { ENV != 'prod' }
+            }
+            steps {
+                sh 'mvn package -DskipTests'
+                sh 'sha256sum target/orderbook.war > target/orderbook.war.sha256'
+                archiveArtifacts artifacts: 'target/*.war, target/*.sha256'
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                withAWS(credentials: "aws-credentials-${ENV}", region: "${AWS_REGION}") {
+                    script {
+                        def imageTag = "${ENV}-${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+                        def fullImageName = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag}"
+
+                        sh """
+                            # Login to ECR
+                            aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                            # Build Docker image with environment labels
+                            docker build --build-arg JAR_FILE=target/orderbook.war \\
+                                        --label "environment=${ENV}" \\
+                                        --label "build.id=${BUILD_NUMBER}" \\
+                                        --label "build.commit=${env.GIT_COMMIT_SHORT}" \\
+                                        --label "build.branch=${SAFE_BRANCH}" \\
+                                        --label "build.date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \\
+                                        -t ${fullImageName} .
+
+                            # Push image
+                            docker push ${fullImageName}
+
+                            # For production, also tag as latest-stable
+                            if [ "${ENV}" = "prod" ]; then
+                                docker tag ${fullImageName} ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest-stable
+                                docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest-stable
+                            fi
+
+                            echo "Successfully pushed: ${fullImageName}"
+                        """
+
+                        // Store image metadata
+                        def metadata = """
+                        {
+                            "environment": "${ENV}",
+                            "buildNumber": "${BUILD_NUMBER}",
+                            "gitCommit": "${env.GIT_COMMIT_SHORT}",
+                            "gitBranch": "${SAFE_BRANCH}",
+                            "imageTag": "${imageTag}",
+                            "fullImageName": "${fullImageName}",
+                            "timestamp": "${new Date().format("yyyy-MM-dd'T'HH:mm:ss'Z'")}"
+                        }
+                        """
+                        writeFile file: "image-metadata-${ENV}.json", text: metadata
+                        archiveArtifacts artifacts: "image-metadata-${ENV}.json"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to EKS') {
+            steps {
+                withAWS(credentials: "aws-credentials-${ENV}", region: "${AWS_REGION}") {
+                    script {
+                        def imageTag = "${ENV}-${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
+                        def fullImageName = "${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag}"
+
+                        sh """#!/bin/bash
+                            set -e
+
+                            echo "Deploying to EKS cluster: ${EKS_CLUSTER_NAME}"
+                            echo "Environment: ${ENV}"
+                            echo "Namespace: ${NAMESPACE}"
+                            echo "Image: ${fullImageName}"
+                            echo "Replicas: ${REPLICAS}"
+
+                            # Configure kubectl
+                            aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+
+                            # Create namespace if not exists
+                            kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+                            # Create ECR pull secret
+                            echo "Creating ECR pull secret..."
+                            kubectl delete secret ecr-pull-secret -n ${NAMESPACE} --ignore-not-found || true
+                            ECR_PASSWORD=\$(aws ecr get-login-password --region ${AWS_REGION})
+                            kubectl create secret docker-registry ecr-pull-secret \\
+                                --docker-server=${ECR_REGISTRY} \\
+                                --docker-username=AWS \\
+                                --docker-password="\${ECR_PASSWORD}" \\
+                                --namespace ${NAMESPACE}
+
+                            # Create deployment configuration
+                            cat > /tmp/deployment-${ENV}.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${APP_NAME}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${APP_NAME}
+    environment: ${ENV}
+    build: ${imageTag}
+spec:
+  replicas: ${REPLICAS}
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${APP_NAME}
+        environment: ${ENV}
+        build: ${imageTag}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "${APP_PORT}"
+        prometheus.io/path: "/actuator/prometheus"
+        deployment.timestamp: "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    spec:
+      imagePullSecrets:
+      - name: ecr-pull-secret
+      containers:
+      - name: ${APP_NAME}
+        image: ${fullImageName}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: ${APP_PORT}
+        env:
+        - name: MANAGEMENT_METRICS_TAGS_APPLICATION
+          value: "${APP_NAME}"
+        - name: MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE
+          value: "prometheus,health,info,metrics"
+        - name: BUILD_NUMBER
+          value: "${imageTag}"
+        - name: SPRING_PROFILES_ACTIVE
+          value: "${ENV}"
+        - name: SERVER_PORT
+          value:
