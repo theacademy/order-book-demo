@@ -476,51 +476,57 @@ EOF
         success {
             script {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
-                    // Get URLs
-                    LB_URL = sh(
+                    // Get URLs and store them in variables
+                    def LB_URL = sh(
                         script: "kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Provisioning'",
                         returnStdout: true
                     ).trim()
 
-                    GRAFANA_URL = sh(
+                    def GRAFANA_URL = sh(
                         script: "kubectl get svc -n ${GRAFANA_NAMESPACE} grafana -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Not available'",
                         returnStdout: true
                     ).trim()
 
-                    PROM_URL = sh(
+                    def PROM_URL = sh(
                         script: "kubectl get svc -n ${PROMETHEUS_NAMESPACE} prometheus-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Not available'",
                         returnStdout: true
                     ).trim()
 
-                    // Get SonarQube project URL
-                    SONAR_PROJECT_URL = "${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                    def GRAFANA_PASS = sh(
+                        script: "kubectl get secret -n ${GRAFANA_NAMESPACE} grafana -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 --decode",
+                        returnStdout: true
+                    ).trim()
 
+                    def SONAR_PROJECT_URL = "${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                    def BUILD_URL_FULL = env.BUILD_URL ?: "https://jenkins/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/"
+
+                    // Print with actual values (using double quotes for variable expansion)
                     echo """
-                        🎉 **DEPLOYMENT SUCCESSFUL** 🎉
-                        =================================
-                        Application: ${APP_NAME}
-                        Version: ${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}
-                        Namespace: ${NAMESPACE}
-                        Cluster: ${EKS_CLUSTER_NAME}
-                        Region: ${AWS_REGION}
+    🎉 **DEPLOYMENT SUCCESSFUL** 🎉
+    =================================
+    Application: ${APP_NAME}
+    Version: ${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}
+    Namespace: ${NAMESPACE}
+    Cluster: ${EKS_CLUSTER_NAME}
+    Region: ${AWS_REGION}
 
-                        📍 **Application URL:** http://\${LB_URL}/api/v1/
-                        🏥 **Health Check:** http://\${LB_URL}/actuator/health
-                        📈 **Prometheus Metrics:** http://\${LB_URL}/actuator/prometheus
+    📍 **Application URL:** http://${LB_URL}/api/v1/
+    🏥 **Health Check:** http://${LB_URL}/actuator/health
+    📈 **Prometheus Metrics:** http://${LB_URL}/actuator/prometheus
 
-                        📊 **Monitoring:**
-                        - Prometheus: http://\${PROM_URL}
-                        - Grafana: http://\${GRAFANA_URL}
-                          Username: admin
-                          Password: \$(kubectl get secret -n grafana grafana -o jsonpath='{.data.admin-password}' | base64 --decode)
+    📊 **Monitoring:**
+    - Prometheus: http://${PROM_URL}
+    - Grafana: http://${GRAFANA_URL}
+      Username: admin
+      Password: ${GRAFANA_PASS}
 
-                        🔍 **Code Quality (SonarQube):**
-                        - Dashboard: \${SONAR_PROJECT_URL}
+    🔍 **Code Quality (SonarQube):**
+    - Dashboard: ${SONAR_PROJECT_URL}
 
-                        📝 **Jenkins Build:** \${BUILD_URL}
-                        📊 **JaCoCo Coverage:** \${BUILD_URL}artifact/target/site/jacoco/index.html
-                        =================================
-                    """
+    📝 **Jenkins Build:** ${BUILD_URL_FULL}
+    📊 **JaCoCo Coverage:** ${BUILD_URL_FULL}artifact/target/site/jacoco/index.html
+    =================================
+    """
                 }
             }
         }
@@ -579,4 +585,3 @@ EOF
             cleanWs()
         }
     }
-}
