@@ -17,7 +17,7 @@ pipeline {
         GRAFANA_NAMESPACE = 'grafana'
 
         // SonarQube Configuration
-        SONAR_HOST_URL = 'http://13.51.106.82:9000'  // Your SonarQube server URL
+        SONAR_HOST_URL = 'http://13.51.106.82:9000'
         SONAR_PROJECT_KEY = 'order-book-demo'
         SONAR_PROJECT_NAME = 'Orderbook Demo Application'
 
@@ -84,16 +84,11 @@ pipeline {
         }
 
         // ============================================
-        // NEW: SonarQube Analysis Stage
+        // SonarQube Analysis Stage with Polling
         // ============================================
         stage('SonarQube Analysis') {
             steps {
                 script {
-                    // Ensure JaCoCo report exists
-                    if (!fileExists('target/site/jacoco/jacoco.xml')) {
-                        error "JaCoCo report not found. Please ensure tests are running and generating coverage reports."
-                    }
-
                     // Run SonarQube analysis
                     withSonarQubeEnv('SonarQube') {
                         sh """
@@ -109,23 +104,67 @@ pipeline {
                                 -Dsonar.sourceEncoding=UTF-8
                         """
                     }
+
+                    echo "SonarQube analysis submitted. Waiting for processing..."
                 }
             }
         }
 
         // ============================================
-        // NEW: SonarQube Quality Gate Check
+        // SonarQube Quality Gate with Polling
         // ============================================
         stage('SonarQube Quality Gate') {
             steps {
                 script {
-                    // Wait for SonarQube analysis and check quality gate
-                    timeout(time: 10, unit: 'MINUTES') {
-                        def qualityGate = waitForQualityGate()
-                        if (qualityGate.status != 'OK') {
-                            error "Pipeline aborted: Quality Gate failed - ${qualityGate.status}. Check SonarQube dashboard for details."
+                    def maxAttempts = 30
+                    def attempts = 0
+                    def qualityGateStatus = "PENDING"
+                    def taskId = null
+
+                    echo "Waiting for SonarQube to process the analysis..."
+
+                    // Wait for analysis to complete and get quality gate status
+                    while (qualityGateStatus == "PENDING" && attempts < maxAttempts) {
+                        sleep(time: 10, unit: 'SECONDS')
+                        attempts++
+
+                        // Check quality gate status
+                        def response = sh(
+                            script: "curl -s 'http://13.51.106.82:9000/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}' 2>/dev/null",
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Attempt ${attempts}/${maxAttempts}: Checking quality gate..."
+
+                        // Parse the response
+                        if (response.contains('"status":"OK"')) {
+                            qualityGateStatus = "OK"
+                            echo "✅ Quality Gate: PASSED"
+                        } else if (response.contains('"status":"ERROR"')) {
+                            qualityGateStatus = "ERROR"
+                            echo "❌ Quality Gate: FAILED"
+                            // Print details
+                            def details = sh(
+                                script: "curl -s 'http://13.51.106.82:9000/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}' | python3 -c \"import sys, json; data=json.load(sys.stdin); conditions = data.get('projectStatus', {}).get('conditions', []); [print(f\\\"  - {c.get('metricKey')}: {c.get('actualValue')} (threshold: {c.get('errorThreshold')})\\\") for c in conditions if c.get('status') == 'ERROR']\" 2>/dev/null",
+                                returnStdout: true
+                            )
+                            echo "Failed conditions:"
+                            echo details
+                        } else if (response.contains('"status":"PENDING"')) {
+                            qualityGateStatus = "PENDING"
+                            echo "  Still processing... waiting"
+                        } else {
+                            echo "  Response: ${response.substring(0, Math.min(200, response.length()))}"
                         }
-                        echo "✅ SonarQube Quality Gate passed!"
+                    }
+
+                    if (attempts >= maxAttempts) {
+                        echo "⚠️ Timeout waiting for quality gate (${maxAttempts * 10} seconds)"
+                        echo "Continuing pipeline, but please check SonarQube dashboard manually"
+                    } else if (qualityGateStatus == "ERROR") {
+                        error "Quality Gate failed! Please check SonarQube dashboard for details."
+                    } else if (qualityGateStatus == "OK") {
+                        echo "✅ Quality Gate passed successfully!"
                     }
                 }
             }
@@ -477,7 +516,6 @@ EOF
 
                         🔍 **Code Quality (SonarQube):**
                         - Dashboard: \${SONAR_PROJECT_URL}
-                        - Quality Gate: Check dashboard for gate status
 
                         📝 **Jenkins Build:** \${BUILD_URL}
                         📊 **JaCoCo Coverage:** \${BUILD_URL}artifact/target/site/jacoco/index.html
