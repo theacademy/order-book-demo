@@ -119,14 +119,14 @@ pipeline {
                     def maxAttempts = 30
                     def attempts = 0
                     def qualityGateStatus = "PENDING"
-                    def taskId = null
 
                     echo "Waiting for SonarQube to process the analysis..."
 
-                    // Wait for analysis to complete and get quality gate status
                     while (qualityGateStatus == "PENDING" && attempts < maxAttempts) {
                         sleep(time: 10, unit: 'SECONDS')
                         attempts++
+
+                        echo "Attempt ${attempts}/${maxAttempts}: Checking quality gate..."
 
                         // Check quality gate status
                         def response = sh(
@@ -134,25 +134,27 @@ pipeline {
                             returnStdout: true
                         ).trim()
 
-                        echo "Attempt ${attempts}/${maxAttempts}: Checking quality gate..."
-
-                        // Parse the response
                         if (response.contains('"status":"OK"')) {
                             qualityGateStatus = "OK"
                             echo "✅ Quality Gate: PASSED"
                         } else if (response.contains('"status":"ERROR"')) {
                             qualityGateStatus = "ERROR"
                             echo "❌ Quality Gate: FAILED"
-                            // Print details
-                            def details = sh(
+
+                            // Extract failed conditions
+                            def conditions = sh(
                                 script: "curl -s 'http://13.51.106.82:9000/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}' | python3 -c \"import sys, json; data=json.load(sys.stdin); conditions = data.get('projectStatus', {}).get('conditions', []); [print(f\\\"  - {c.get('metricKey')}: {c.get('actualValue')} (threshold: {c.get('errorThreshold')})\\\") for c in conditions if c.get('status') == 'ERROR']\" 2>/dev/null",
                                 returnStdout: true
                             )
-                            echo "Failed conditions:"
-                            echo details
-                        } else if (response.contains('"status":"PENDING"')) {
+                            if (conditions.trim()) {
+                                echo "Failed conditions:"
+                                echo conditions
+                            }
+                        } else if (response.contains('"status":"PENDING"') || response.contains('"status":"NONE"')) {
                             qualityGateStatus = "PENDING"
                             echo "  Still processing... waiting"
+                        } else if (response.isEmpty()) {
+                            echo "  Waiting for analysis to start..."
                         } else {
                             echo "  Response: ${response.substring(0, Math.min(200, response.length()))}"
                         }
@@ -372,32 +374,6 @@ EOF
                             echo "✅ Deployment successful!"
                             echo "📊 Service information:"
                             kubectl get svc -n ${NAMESPACE} ${APP_NAME}
-
-                            # Get load balancer URL
-                            LB_URL=\$(kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-                            if [ -n "\$LB_URL" ]; then
-                                echo "🌐 Application URL: http://\$LB_URL/api/v1/"
-                                echo "🏥 Health check: http://\$LB_URL/actuator/health"
-                                echo "📈 Metrics: http://\$LB_URL/actuator/prometheus"
-                            else
-                                echo "⏳ LoadBalancer provisioning in progress..."
-                            fi
-
-                            # Get Grafana and Prometheus URLs
-                            echo ""
-                            echo "📊 MONITORING URLs:"
-                            GRAFANA_URL=\$(kubectl get svc -n ${GRAFANA_NAMESPACE} grafana -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-                            PROM_URL=\$(kubectl get svc -n ${PROMETHEUS_NAMESPACE} prometheus-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-
-                            if [ -n "\$GRAFANA_URL" ]; then
-                                echo "📈 Grafana: http://\$GRAFANA_URL"
-                                echo "   Username: admin"
-                                echo "   Password: \$(kubectl get secret -n ${GRAFANA_NAMESPACE} grafana -o jsonpath='{.data.admin-password}' | base64 --decode)"
-                            fi
-
-                            if [ -n "\$PROM_URL" ]; then
-                                echo "📊 Prometheus: http://\$PROM_URL"
-                            fi
                         """
                     }
                 }
@@ -476,7 +452,7 @@ EOF
         success {
             script {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
-                    // Get URLs and store them in variables
+                    // Get all URLs dynamically
                     def LB_URL = sh(
                         script: "kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Provisioning'",
                         returnStdout: true
@@ -498,35 +474,36 @@ EOF
                     ).trim()
 
                     def SONAR_PROJECT_URL = "${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
-                    def BUILD_URL_FULL = env.BUILD_URL ?: "https://jenkins/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/"
+                    def BUILD_URL_FULL = env.BUILD_URL ?: "http://16.16.201.50:8080/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/"
+                    def COVERAGE_URL = "${BUILD_URL_FULL}artifact/target/site/jacoco/index.html"
 
-                    // Print with actual values (using double quotes for variable expansion)
+                    // Print success message with actual values
                     echo """
-    🎉 **DEPLOYMENT SUCCESSFUL** 🎉
-    =================================
-    Application: ${APP_NAME}
-    Version: ${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}
-    Namespace: ${NAMESPACE}
-    Cluster: ${EKS_CLUSTER_NAME}
-    Region: ${AWS_REGION}
+🎉 **DEPLOYMENT SUCCESSFUL** 🎉
+=================================
+Application: ${APP_NAME}
+Version: ${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}
+Namespace: ${NAMESPACE}
+Cluster: ${EKS_CLUSTER_NAME}
+Region: ${AWS_REGION}
 
-    📍 **Application URL:** http://${LB_URL}/api/v1/
-    🏥 **Health Check:** http://${LB_URL}/actuator/health
-    📈 **Prometheus Metrics:** http://${LB_URL}/actuator/prometheus
+📍 **Application URL:** http://${LB_URL}/api/v1/
+🏥 **Health Check:** http://${LB_URL}/actuator/health
+📈 **Prometheus Metrics:** http://${LB_URL}/actuator/prometheus
 
-    📊 **Monitoring:**
-    - Prometheus: http://${PROM_URL}
-    - Grafana: http://${GRAFANA_URL}
-      Username: admin
-      Password: ${GRAFANA_PASS}
+📊 **Monitoring:**
+- Prometheus: http://${PROM_URL}
+- Grafana: http://${GRAFANA_URL}
+  Username: admin
+  Password: ${GRAFANA_PASS}
 
-    🔍 **Code Quality (SonarQube):**
-    - Dashboard: ${SONAR_PROJECT_URL}
+🔍 **Code Quality (SonarQube):**
+- Dashboard: ${SONAR_PROJECT_URL}
 
-    📝 **Jenkins Build:** ${BUILD_URL_FULL}
-    📊 **JaCoCo Coverage:** ${BUILD_URL_FULL}artifact/target/site/jacoco/index.html
-    =================================
-    """
+📝 **Jenkins Build:** ${BUILD_URL_FULL}
+📊 **JaCoCo Coverage:** ${COVERAGE_URL}
+=================================
+"""
                 }
             }
         }
@@ -545,7 +522,7 @@ EOF
 
                         # Check cluster connectivity
                         echo "🔌 Cluster Info:"
-                        kubectl cluster-info
+                        kubectl cluster-info 2>&1 || echo "Unable to connect to cluster"
 
                         # Check if namespace exists
                         if kubectl get namespace ${NAMESPACE} &>/dev/null; then
@@ -585,3 +562,4 @@ EOF
             cleanWs()
         }
     }
+}
