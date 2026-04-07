@@ -4,13 +4,17 @@ pipeline {
     environment {
         // AWS Configuration
         AWS_REGION = 'eu-central-1'
-        EKS_CLUSTER_NAME = 'test-cluster-1'
+        EKS_CLUSTER_NAME = 'test-cluster-2'  // Updated to new cluster
         AWS_ACCOUNT_ID = '271758791556'
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         ECR_REPOSITORY = 'orderbook-tomcat'
         APP_NAME = 'orderbook'
-        NAMESPACE = 'qa'
+        NAMESPACE = 'qa'  // Matches your existing namespace
         APP_PORT = '8085'
+
+        // Monitoring Configuration
+        PROMETHEUS_NAMESPACE = 'prometheus'
+        GRAFANA_NAMESPACE = 'grafana'
 
         // Quality Gates
         MIN_COVERAGE = '70'
@@ -53,7 +57,6 @@ pipeline {
 
                 stage('Test with Coverage') {
                     steps {
-                        // Run tests with JaCoCo coverage (single command, no separate instrumentation)
                         sh 'mvn clean test jacoco:report -Pcoverage'
                     }
                 }
@@ -62,11 +65,7 @@ pipeline {
 
         stage('Publish Test & Coverage Reports') {
             steps {
-                // Publish JUnit test results
                 junit 'target/surefire-reports/*.xml'
-
-                // Publish JaCoCo coverage report using the modern Coverage Plugin
-                // Note: Install "Coverage Plugin" in Jenkins (deprecated JaCoCo plugin replaced)
                 recordCoverage(
                     tools: [[
                         parser: 'JACOCO',
@@ -74,8 +73,6 @@ pipeline {
                     ]],
                     sourceCodeRetention: 'MODIFIED'
                 )
-
-                // Archive HTML reports
                 archiveArtifacts artifacts: 'target/site/jacoco/**', fingerprint: true
                 echo "✅ JaCoCo HTML report archived in build artifacts"
             }
@@ -91,14 +88,12 @@ pipeline {
             steps {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
                     script {
-                        // Use GIT_COMMIT_SHORT from environment
                         def imageTag = "${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
-
                         sh """
                             # Login to ECR
                             aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
-                            # Build Docker image with build args
+                            # Build Docker image
                             docker build --build-arg JAR_FILE=target/orderbook.war \\
                                         -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag} \\
                                         -t ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest .
@@ -117,13 +112,12 @@ pipeline {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
                     script {
                         def imageTag = "${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}"
-
                         sh """#!/bin/bash
                             set -e
 
                             echo "🚀 Deploying to EKS cluster: ${EKS_CLUSTER_NAME}"
 
-                            # Configure kubectl
+                            # Configure kubectl for new cluster
                             aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
 
                             # Create namespace if not exists
@@ -139,7 +133,34 @@ pipeline {
                                 --docker-password="\${ECR_PASSWORD}" \\
                                 --namespace ${NAMESPACE}
 
-                            # Create temporary deployment file
+                            # Create ServiceMonitor for Prometheus
+                            echo "📊 Creating ServiceMonitor for Prometheus..."
+                            cat > /tmp/servicemonitor.yaml << 'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ${APP_NAME}
+  namespace: ${PROMETHEUS_NAMESPACE}
+  labels:
+    app: ${APP_NAME}
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: ${APP_NAME}
+  endpoints:
+  - port: metrics
+    path: /actuator/prometheus
+    interval: 30s
+    scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+    - ${NAMESPACE}
+EOF
+
+                            kubectl apply -f /tmp/servicemonitor.yaml || echo "ServiceMonitor may require CRDs installed"
+
+                            # Create deployment and service
                             echo "📦 Creating deployment configuration..."
                             cat > /tmp/deployment.yaml << 'EOF'
 apiVersion: apps/v1
@@ -149,7 +170,8 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     app: ${APP_NAME}
-    build: ${imageTag}
+    version: ${imageTag}
+    monitored-by: prometheus
 spec:
   replicas: 2
   selector:
@@ -159,7 +181,8 @@ spec:
     metadata:
       labels:
         app: ${APP_NAME}
-        build: ${imageTag}
+        version: ${imageTag}
+        monitored-by: prometheus
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "${APP_PORT}"
@@ -170,8 +193,12 @@ spec:
       containers:
       - name: ${APP_NAME}
         image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${imageTag}
+        imagePullPolicy: Always
         ports:
         - containerPort: ${APP_PORT}
+          name: http
+        - containerPort: ${APP_PORT}
+          name: metrics
         env:
         - name: MANAGEMENT_METRICS_TAGS_APPLICATION
           value: "${APP_NAME}"
@@ -221,7 +248,7 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     app: ${APP_NAME}
-    build: ${imageTag}
+    monitored-by: prometheus
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/port: "${APP_PORT}"
@@ -234,9 +261,11 @@ spec:
   - name: http
     port: 80
     targetPort: ${APP_PORT}
+    protocol: TCP
   - name: metrics
     port: ${APP_PORT}
     targetPort: ${APP_PORT}
+    protocol: TCP
 EOF
 
                             # Apply the deployment
@@ -261,6 +290,22 @@ EOF
                             else
                                 echo "⏳ LoadBalancer provisioning in progress..."
                             fi
+
+                            # Get Grafana and Prometheus URLs
+                            echo ""
+                            echo "📊 MONITORING URLs:"
+                            GRAFANA_URL=\$(kubectl get svc -n ${GRAFANA_NAMESPACE} grafana -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+                            PROM_URL=\$(kubectl get svc -n ${PROMETHEUS_NAMESPACE} prometheus-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+
+                            if [ -n "\$GRAFANA_URL" ]; then
+                                echo "📈 Grafana: http://\$GRAFANA_URL"
+                                echo "   Username: admin"
+                                echo "   Password: \$(kubectl get secret -n ${GRAFANA_NAMESPACE} grafana -o jsonpath='{.data.admin-password}' | base64 --decode)"
+                            fi
+
+                            if [ -n "\$PROM_URL" ]; then
+                                echo "📊 Prometheus: http://\$PROM_URL"
+                            fi
                         """
                     }
                 }
@@ -282,6 +327,13 @@ EOF
                             echo -e "\n🌐 Service Details:"
                             kubectl get svc -n ${NAMESPACE} ${APP_NAME}
 
+                            # Check if metrics endpoint is accessible
+                            echo -e "\n📈 Checking metrics endpoint..."
+                            POD_NAME=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o jsonpath='{.items[0].metadata.name}')
+                            if [ -n "\$POD_NAME" ]; then
+                                kubectl exec -n ${NAMESPACE} \$POD_NAME -- curl -s http://localhost:${APP_PORT}/actuator/prometheus | head -5
+                            fi
+
                             # Check if all pods are ready
                             READY_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} --field-selector status.phase=Running | grep -v NAME | wc -l)
                             TOTAL_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} --no-headers | wc -l)
@@ -300,19 +352,54 @@ EOF
                 }
             }
         }
+
+        stage('Verify Prometheus Integration') {
+            steps {
+                withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
+                    script {
+                        sh """#!/bin/bash
+                            echo "🔍 Verifying Prometheus integration..."
+
+                            # Check if ServiceMonitor exists
+                            if kubectl get servicemonitor -n ${PROMETHEUS_NAMESPACE} ${APP_NAME} &>/dev/null; then
+                                echo "✅ ServiceMonitor found"
+                            else
+                                echo "⚠️ ServiceMonitor not found (may require Prometheus Operator CRDs)"
+                            fi
+
+                            # Query Prometheus for application metrics
+                            PROM_URL=\$(kubectl get svc -n ${PROMETHEUS_NAMESPACE} prometheus-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+                            if [ -n "\$PROM_URL" ]; then
+                                echo "📊 Checking if metrics are being scraped..."
+                                curl -s "http://\$PROM_URL/api/v1/query?query=up{app='${APP_NAME}'}" | head -10
+                            fi
+                        """
+                    }
+                }
+            }
+        }
     }
 
     post {
         success {
             script {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
-                    // Get application URL
+                    // Get URLs
                     LB_URL = sh(
                         script: "kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Provisioning'",
                         returnStdout: true
                     ).trim()
 
-                    // Send notification
+                    GRAFANA_URL = sh(
+                        script: "kubectl get svc -n ${GRAFANA_NAMESPACE} grafana -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Not available'",
+                        returnStdout: true
+                    ).trim()
+
+                    PROM_URL = sh(
+                        script: "kubectl get svc -n ${PROMETHEUS_NAMESPACE} prometheus-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo 'Not available'",
+                        returnStdout: true
+                    ).trim()
+
                     echo """
                         🎉 **DEPLOYMENT SUCCESSFUL** 🎉
                         =================================
@@ -320,13 +407,25 @@ EOF
                         Version: ${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}
                         Namespace: ${NAMESPACE}
                         Cluster: ${EKS_CLUSTER_NAME}
+                        Region: ${AWS_REGION}
 
-                        📍 Application URL: http://${LB_URL}
-                        🏥 Health Check: http://${LB_URL}/actuator/health
-                        📈 Prometheus Metrics: http://${LB_URL}/actuator/prometheus
-                        📊 JaCoCo Coverage: ${BUILD_URL}artifact/target/site/jacoco/index.html
+                        📍 **Application URL:** http://${LB_URL}
+                        🏥 **Health Check:** http://${LB_URL}/actuator/health
+                        📈 **Prometheus Metrics:** http://${LB_URL}/actuator/prometheus
+
+                        📊 **Monitoring:**
+                        - Prometheus: http://${PROM_URL}
+                        - Grafana: http://${GRAFANA_URL}
+                          Username: admin
+                          Password: (kubectl get secret -n grafana grafana -o jsonpath='{.data.admin-password}' | base64 --decode)
+
+                        📝 **Jenkins Build:** ${BUILD_URL}
+                        📊 **JaCoCo Coverage:** ${BUILD_URL}artifact/target/site/jacoco/index.html
                         =================================
                     """
+
+                    // Optionally send to Slack or email
+                    // slackSend(color: 'good', message: "Deployment successful: ${APP_NAME} v${BUILD_NUMBER}")
                 }
             }
         }
@@ -339,6 +438,13 @@ EOF
                     sh """#!/bin/bash
                         echo "🔍 **DIAGNOSTIC INFORMATION**"
                         echo "================================"
+                        echo "Cluster: ${EKS_CLUSTER_NAME}"
+                        echo "Namespace: ${NAMESPACE}"
+                        echo ""
+
+                        # Check cluster connectivity
+                        echo "🔌 Cluster Info:"
+                        kubectl cluster-info
 
                         # Check if namespace exists
                         if kubectl get namespace ${NAMESPACE} &>/dev/null; then
@@ -346,16 +452,16 @@ EOF
                             kubectl get pods -n ${NAMESPACE}
 
                             echo -e "\n📝 Recent Pod Events:"
-                            kubectl describe pods -n ${NAMESPACE} | grep -A20 Events
+                            kubectl describe pods -n ${NAMESPACE} | grep -A20 Events || echo "No events"
 
                             echo -e "\n📋 Recent Logs:"
                             for pod in \$(kubectl get pods -n ${NAMESPACE} -o name | head -2); do
                                 echo "--- \$pod ---"
-                                kubectl logs \$pod -n ${NAMESPACE} --tail=30
+                                kubectl logs \$pod -n ${NAMESPACE} --tail=50 || echo "No logs"
                             done
 
                             echo -e "\n⚙️ Deployment Status:"
-                            kubectl describe deployment ${APP_NAME} -n ${NAMESPACE}
+                            kubectl describe deployment ${APP_NAME} -n ${NAMESPACE} || echo "Deployment not found"
                         else
                             echo "Namespace ${NAMESPACE} does not exist"
                         fi
@@ -372,10 +478,8 @@ EOF
         }
 
         always {
-            // Archive test results and coverage reports
             junit 'target/surefire-reports/*.xml'
             archiveArtifacts artifacts: 'target/site/jacoco/**', fingerprint: true
-
             echo "🧹 Cleaning up workspace..."
             cleanWs()
         }
