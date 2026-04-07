@@ -4,17 +4,22 @@ pipeline {
     environment {
         // AWS Configuration
         AWS_REGION = 'eu-central-1'
-        EKS_CLUSTER_NAME = 'test-cluster-2'  // Updated to new cluster
+        EKS_CLUSTER_NAME = 'test-cluster-2'
         AWS_ACCOUNT_ID = '271758791556'
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         ECR_REPOSITORY = 'orderbook-tomcat'
         APP_NAME = 'orderbook'
-        NAMESPACE = 'qa'  // Matches your existing namespace
+        NAMESPACE = 'qa'
         APP_PORT = '8085'
 
         // Monitoring Configuration
         PROMETHEUS_NAMESPACE = 'prometheus'
         GRAFANA_NAMESPACE = 'grafana'
+
+        // SonarQube Configuration
+        SONAR_HOST_URL = 'http://13.51.106.82:9000'  // Your SonarQube server URL
+        SONAR_PROJECT_KEY = 'order-book-demo'
+        SONAR_PROJECT_NAME = 'Orderbook Demo Application'
 
         // Quality Gates
         MIN_COVERAGE = '70'
@@ -75,6 +80,54 @@ pipeline {
                 )
                 archiveArtifacts artifacts: 'target/site/jacoco/**', fingerprint: true
                 echo "✅ JaCoCo HTML report archived in build artifacts"
+            }
+        }
+
+        // ============================================
+        // NEW: SonarQube Analysis Stage
+        // ============================================
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    // Ensure JaCoCo report exists
+                    if (!fileExists('target/site/jacoco/jacoco.xml')) {
+                        error "JaCoCo report not found. Please ensure tests are running and generating coverage reports."
+                    }
+
+                    // Run SonarQube analysis
+                    withSonarQubeEnv('SonarQube') {
+                        sh """
+                            mvn sonar:sonar \\
+                                -Dsonar.host.url=${SONAR_HOST_URL} \\
+                                -Dsonar.projectKey=${SONAR_PROJECT_KEY} \\
+                                -Dsonar.projectName='${SONAR_PROJECT_NAME}' \\
+                                -Dsonar.java.binaries=target/classes \\
+                                -Dsonar.java.test.binaries=target/test-classes \\
+                                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \\
+                                -Dsonar.junit.reportPaths=target/surefire-reports \\
+                                -Dsonar.java.pmd.reportPaths=target/pmd.xml \\
+                                -Dsonar.sourceEncoding=UTF-8
+                        """
+                    }
+                }
+            }
+        }
+
+        // ============================================
+        // NEW: SonarQube Quality Gate Check
+        // ============================================
+        stage('SonarQube Quality Gate') {
+            steps {
+                script {
+                    // Wait for SonarQube analysis and check quality gate
+                    timeout(time: 10, unit: 'MINUTES') {
+                        def qualityGate = waitForQualityGate()
+                        if (qualityGate.status != 'OK') {
+                            error "Pipeline aborted: Quality Gate failed - ${qualityGate.status}. Check SonarQube dashboard for details."
+                        }
+                        echo "✅ SonarQube Quality Gate passed!"
+                    }
+                }
             }
         }
 
@@ -284,7 +337,7 @@ EOF
                             # Get load balancer URL
                             LB_URL=\$(kubectl get svc -n ${NAMESPACE} ${APP_NAME} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
                             if [ -n "\$LB_URL" ]; then
-                                echo "🌐 Application URL: http://\$LB_URL"
+                                echo "🌐 Application URL: http://\$LB_URL/api/v1/"
                                 echo "🏥 Health check: http://\$LB_URL/actuator/health"
                                 echo "📈 Metrics: http://\$LB_URL/actuator/prometheus"
                             else
@@ -400,6 +453,9 @@ EOF
                         returnStdout: true
                     ).trim()
 
+                    // Get SonarQube project URL
+                    SONAR_PROJECT_URL = "${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+
                     echo """
                         🎉 **DEPLOYMENT SUCCESSFUL** 🎉
                         =================================
@@ -409,23 +465,24 @@ EOF
                         Cluster: ${EKS_CLUSTER_NAME}
                         Region: ${AWS_REGION}
 
-                        📍 **Application URL:** http://${LB_URL}
-                        🏥 **Health Check:** http://${LB_URL}/actuator/health
-                        📈 **Prometheus Metrics:** http://${LB_URL}/actuator/prometheus
+                        📍 **Application URL:** http://\${LB_URL}/api/v1/
+                        🏥 **Health Check:** http://\${LB_URL}/actuator/health
+                        📈 **Prometheus Metrics:** http://\${LB_URL}/actuator/prometheus
 
                         📊 **Monitoring:**
-                        - Prometheus: http://${PROM_URL}
-                        - Grafana: http://${GRAFANA_URL}
+                        - Prometheus: http://\${PROM_URL}
+                        - Grafana: http://\${GRAFANA_URL}
                           Username: admin
-                          Password: (kubectl get secret -n grafana grafana -o jsonpath='{.data.admin-password}' | base64 --decode)
+                          Password: \$(kubectl get secret -n grafana grafana -o jsonpath='{.data.admin-password}' | base64 --decode)
 
-                        📝 **Jenkins Build:** ${BUILD_URL}
-                        📊 **JaCoCo Coverage:** ${BUILD_URL}artifact/target/site/jacoco/index.html
+                        🔍 **Code Quality (SonarQube):**
+                        - Dashboard: \${SONAR_PROJECT_URL}
+                        - Quality Gate: Check dashboard for gate status
+
+                        📝 **Jenkins Build:** \${BUILD_URL}
+                        📊 **JaCoCo Coverage:** \${BUILD_URL}artifact/target/site/jacoco/index.html
                         =================================
                     """
-
-                    // Optionally send to Slack or email
-                    // slackSend(color: 'good', message: "Deployment successful: ${APP_NAME} v${BUILD_NUMBER}")
                 }
             }
         }
