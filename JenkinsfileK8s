@@ -79,7 +79,7 @@ pipeline {
                     sourceCodeRetention: 'MODIFIED'
                 )
                 archiveArtifacts artifacts: 'target/site/jacoco/**', fingerprint: true
-                echo "✅ JaCoCo HTML report archived in build artifacts"
+                echo "JaCoCo HTML report archived in build artifacts"
             }
         }
 
@@ -136,10 +136,10 @@ pipeline {
 
                         if (response.contains('"status":"OK"')) {
                             qualityGateStatus = "OK"
-                            echo "✅ Quality Gate: PASSED"
+                            echo "Quality Gate: PASSED"
                         } else if (response.contains('"status":"ERROR"')) {
                             qualityGateStatus = "ERROR"
-                            echo "❌ Quality Gate: FAILED"
+                            echo " Quality Gate: FAILED"
 
                             // Extract failed conditions
                             def conditions = sh(
@@ -152,21 +152,21 @@ pipeline {
                             }
                         } else if (response.contains('"status":"PENDING"') || response.contains('"status":"NONE"')) {
                             qualityGateStatus = "PENDING"
-                            echo "  Still processing... waiting"
+                            echo "Still processing... waiting"
                         } else if (response.isEmpty()) {
                             echo "  Waiting for analysis to start..."
                         } else {
-                            echo "  Response: ${response.substring(0, Math.min(200, response.length()))}"
+                            echo "Response: ${response.substring(0, Math.min(200, response.length()))}"
                         }
                     }
 
                     if (attempts >= maxAttempts) {
-                        echo "⚠️ Timeout waiting for quality gate (${maxAttempts * 10} seconds)"
+                        echo "Timeout waiting for quality gate (${maxAttempts * 10} seconds)"
                         echo "Continuing pipeline, but please check SonarQube dashboard manually"
                     } else if (qualityGateStatus == "ERROR") {
                         error "Quality Gate failed! Please check SonarQube dashboard for details."
                     } else if (qualityGateStatus == "OK") {
-                        echo "✅ Quality Gate passed successfully!"
+                        echo "Quality Gate passed successfully!"
                     }
                 }
             }
@@ -209,7 +209,7 @@ pipeline {
                         sh """#!/bin/bash
                             set -e
 
-                            echo "🚀 Deploying to EKS cluster: ${EKS_CLUSTER_NAME}"
+                            echo "Deploying to EKS cluster: ${EKS_CLUSTER_NAME}"
 
                             # Configure kubectl for new cluster
                             aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
@@ -218,7 +218,7 @@ pipeline {
                             kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
                             # Create ECR pull secret
-                            echo "🔑 Creating ECR pull secret..."
+                            echo "Creating ECR pull secret..."
                             kubectl delete secret ecr-pull-secret -n ${NAMESPACE} --ignore-not-found
                             ECR_PASSWORD=\$(aws ecr get-login-password --region ${AWS_REGION})
                             kubectl create secret docker-registry ecr-pull-secret \\
@@ -228,7 +228,7 @@ pipeline {
                                 --namespace ${NAMESPACE}
 
                             # Create ServiceMonitor for Prometheus
-                            echo "📊 Creating ServiceMonitor for Prometheus..."
+                            echo "Creating ServiceMonitor for Prometheus..."
                             cat > /tmp/servicemonitor.yaml << 'EOF'
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -255,7 +255,7 @@ EOF
                             kubectl apply -f /tmp/servicemonitor.yaml || echo "ServiceMonitor may require CRDs installed"
 
                             # Create deployment and service
-                            echo "📦 Creating deployment configuration..."
+                            echo "Creating deployment configuration..."
                             cat > /tmp/deployment.yaml << 'EOF'
 apiVersion: apps/v1
 kind: Deployment
@@ -363,7 +363,7 @@ spec:
 EOF
 
                             # Apply the deployment
-                            echo "🚀 Applying Kubernetes manifests..."
+                            echo "Applying Kubernetes manifests..."
                             kubectl apply -f /tmp/deployment.yaml
 
                             # Wait for rollout
@@ -371,8 +371,8 @@ EOF
                             kubectl rollout status deployment/${APP_NAME} -n ${NAMESPACE} --timeout=5m
 
                             # Get service information
-                            echo "✅ Deployment successful!"
-                            echo "📊 Service information:"
+                            echo "Deployment successful!"
+                            echo "Service information:"
                             kubectl get svc -n ${NAMESPACE} ${APP_NAME}
                         """
                     }
@@ -385,18 +385,18 @@ EOF
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
                     script {
                         sh """#!/bin/bash
-                            echo "🔍 Verifying deployment..."
+                            echo "Verifying deployment..."
 
                             # Check pod status
-                            echo "📊 Pod Status:"
+                            echo "Pod Status:"
                             kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME}
 
                             # Check service
-                            echo -e "\n🌐 Service Details:"
+                            echo -e "\nService Details:"
                             kubectl get svc -n ${NAMESPACE} ${APP_NAME}
 
                             # Check if metrics endpoint is accessible
-                            echo -e "\n📈 Checking metrics endpoint..."
+                            echo -e "\nChecking metrics endpoint..."
                             POD_NAME=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} -o jsonpath='{.items[0].metadata.name}')
                             if [ -n "\$POD_NAME" ]; then
                                 kubectl exec -n ${NAMESPACE} \$POD_NAME -- curl -s http://localhost:${APP_PORT}/actuator/prometheus | head -5
@@ -407,11 +407,11 @@ EOF
                             TOTAL_PODS=\$(kubectl get pods -n ${NAMESPACE} -l app=${APP_NAME} --no-headers | wc -l)
 
                             if [ "\$READY_PODS" -eq "\$TOTAL_PODS" ] && [ "\$TOTAL_PODS" -gt 0 ]; then
-                                echo "✅ All \$TOTAL_PODS pods are running!"
+                                echo "All \$TOTAL_PODS pods are running!"
                                 exit 0
                             else
-                                echo "❌ Only \$READY_PODS/\$TOTAL_PODS pods are ready"
-                                echo "📝 Recent pod events:"
+                                echo "Only \$READY_PODS/\$TOTAL_PODS pods are ready"
+                                echo "Recent pod events:"
                                 kubectl describe pods -n ${NAMESPACE} -l app=${APP_NAME} | grep -A10 Events
                                 exit 1
                             fi
@@ -426,19 +426,19 @@ EOF
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
                     script {
                         sh """#!/bin/bash
-                            echo "🔍 Verifying Prometheus integration..."
+                            echo "Verifying Prometheus integration..."
 
                             # Check if ServiceMonitor exists
                             if kubectl get servicemonitor -n ${PROMETHEUS_NAMESPACE} ${APP_NAME} &>/dev/null; then
-                                echo "✅ ServiceMonitor found"
+                                echo "ServiceMonitor found"
                             else
-                                echo "⚠️ ServiceMonitor not found (may require Prometheus Operator CRDs)"
+                                echo "ServiceMonitor not found (may require Prometheus Operator CRDs)"
                             fi
 
                             # Query Prometheus for application metrics
                             PROM_URL=\$(kubectl get svc -n ${PROMETHEUS_NAMESPACE} prometheus-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
                             if [ -n "\$PROM_URL" ]; then
-                                echo "📊 Checking if metrics are being scraped..."
+                                echo "Checking if metrics are being scraped..."
                                 curl -s "http://\$PROM_URL/api/v1/query?query=up{app='${APP_NAME}'}" | head -10
                             fi
                         """
@@ -479,7 +479,7 @@ EOF
 
                     // Print success message with actual values
                     echo """
-🎉 **DEPLOYMENT SUCCESSFUL** 🎉
+**DEPLOYMENT SUCCESSFUL**
 =================================
 Application: ${APP_NAME}
 Version: ${BUILD_NUMBER}-${env.GIT_COMMIT_SHORT}
@@ -487,21 +487,21 @@ Namespace: ${NAMESPACE}
 Cluster: ${EKS_CLUSTER_NAME}
 Region: ${AWS_REGION}
 
-📍 **Application URL:** http://${LB_URL}/api/v1/
-🏥 **Health Check:** http://${LB_URL}/actuator/health
-📈 **Prometheus Metrics:** http://${LB_URL}/actuator/prometheus
+**Application URL:** http://${LB_URL}/api/v1/
+**Health Check:** http://${LB_URL}/actuator/health
+**Prometheus Metrics:** http://${LB_URL}/actuator/prometheus
 
-📊 **Monitoring:**
+**Monitoring:**
 - Prometheus: http://${PROM_URL}
 - Grafana: http://${GRAFANA_URL}
   Username: admin
   Password: ${GRAFANA_PASS}
 
-🔍 **Code Quality (SonarQube):**
+**Code Quality (SonarQube):**
 - Dashboard: ${SONAR_PROJECT_URL}
 
-📝 **Jenkins Build:** ${BUILD_URL_FULL}
-📊 **JaCoCo Coverage:** ${COVERAGE_URL}
+**Jenkins Build:** ${BUILD_URL_FULL}
+**JaCoCo Coverage:** ${COVERAGE_URL}
 =================================
 """
                 }
@@ -511,28 +511,28 @@ Region: ${AWS_REGION}
         failure {
             script {
                 withAWS(credentials: 'aws-credentials', region: "${AWS_REGION}") {
-                    echo "❌ Pipeline failed! Gathering diagnostics..."
+                    echo "Pipeline failed! Gathering diagnostics..."
 
                     sh """#!/bin/bash
-                        echo "🔍 **DIAGNOSTIC INFORMATION**"
+                        echo "**DIAGNOSTIC INFORMATION**"
                         echo "================================"
                         echo "Cluster: ${EKS_CLUSTER_NAME}"
                         echo "Namespace: ${NAMESPACE}"
                         echo ""
 
                         # Check cluster connectivity
-                        echo "🔌 Cluster Info:"
+                        echo "Cluster Info:"
                         kubectl cluster-info 2>&1 || echo "Unable to connect to cluster"
 
                         # Check if namespace exists
                         if kubectl get namespace ${NAMESPACE} &>/dev/null; then
-                            echo "📊 Pod Status in ${NAMESPACE}:"
+                            echo "Pod Status in ${NAMESPACE}:"
                             kubectl get pods -n ${NAMESPACE}
 
-                            echo -e "\n📝 Recent Pod Events:"
+                            echo -e "\nRecent Pod Events:"
                             kubectl describe pods -n ${NAMESPACE} | grep -A20 Events || echo "No events"
 
-                            echo -e "\n📋 Recent Logs:"
+                            echo -e "\nRecent Logs:"
                             for pod in \$(kubectl get pods -n ${NAMESPACE} -o name | head -2); do
                                 echo "--- \$pod ---"
                                 kubectl logs \$pod -n ${NAMESPACE} --tail=50 || echo "No logs"
@@ -544,7 +544,7 @@ Region: ${AWS_REGION}
                             echo "Namespace ${NAMESPACE} does not exist"
                         fi
 
-                        echo -e "\n📦 Recent Images in ECR:"
+                        echo -e "\nRecent Images in ECR:"
                         aws ecr describe-images --repository-name ${ECR_REPOSITORY} --region ${AWS_REGION} \\
                             --query 'imageDetails[*].{Tags:imageTags, PushedAt:imagePushedAt}' \\
                             --output table | head -20
@@ -558,7 +558,7 @@ Region: ${AWS_REGION}
         always {
             junit 'target/surefire-reports/*.xml'
             archiveArtifacts artifacts: 'target/site/jacoco/**', fingerprint: true
-            echo "🧹 Cleaning up workspace..."
+            echo "Cleaning up workspace..."
             cleanWs()
         }
     }
