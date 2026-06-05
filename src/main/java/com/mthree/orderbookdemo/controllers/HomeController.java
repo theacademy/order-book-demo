@@ -18,7 +18,7 @@ public String hello() {
 	catch(Exception e){
 		// Exception handling - currently suppressed
 	}
-	return "Welcome to Spring Boot Application!!";
+	return "Welcome to CI/CD Pipeline!!";
 }
 	
 
