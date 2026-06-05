@@ -73,6 +73,7 @@ pipeline {
                       }
                  }
 
+
                   stage('deploy-QA') {
                              steps {
                                      sh script: 'cd  $WORKSPACE'
